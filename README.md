@@ -2,6 +2,7 @@
 
 WebRTC transport for libp2p.
 
+```
 ┌───────────────┐  ┌───────────────┐
 │               │  │               │
 │ TcpTransport  │  │ UdpTransport  │
@@ -14,8 +15,10 @@ WebRTC transport for libp2p.
          │ WebRTCTransport │
          │                 │
          └─────────────────┘
+```
 
 TODO:
 
 - [ ] Transport interface
 - [ ] UDP transport
+- [ ] integration tests
