@@ -35,7 +35,9 @@ impl<E: fmt::Display> fmt::Display for Error<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Transport(err) => write!(f, "{}", err),
-            Error::InvalidMultiaddr(ma) => write!(f, "invalid multi-address: {}", ma),
+            Error::InvalidMultiaddr(ma) => {
+                write!(f, "invalid multi-address: {}", ma)
+            },
         }
     }
 }

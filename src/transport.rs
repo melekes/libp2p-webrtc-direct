@@ -21,34 +21,46 @@
 //! Implementation of the [`Transport`] trait for WebRTC (direct communication without a signaling
 //! server).
 
-// use webrtc::peer_connection::RTCPeerConnection;
-
-use crate::error::Error;
-use bytes::Bytes;
-use futures::{future::BoxFuture, prelude::*, stream::BoxStream};
 use libp2p_core::{
     connection::Endpoint,
-    // either::EitherOutput,
     multiaddr::{Multiaddr, Protocol},
     transport::{ListenerEvent, TransportError},
     Transport,
 };
+
+use bytes::Bytes;
+use futures::{future::BoxFuture, prelude::*, stream::BoxStream};
+
+use log::{debug, trace};
+use webrtc::api::setting_engine::SettingEngine;
+use webrtc::dtls_transport::dtls_role::DTLSRole;
+use webrtc::peer_connection::certificate::RTCCertificate;
+use webrtc::peer_connection::configuration::RTCConfiguration;
+// use webrtc::peer_connection::RTCPeerConnection;
+use tokio::net::UdpSocket;
+use webrtc::api::APIBuilder;
+use webrtc_ice::udp_mux::UDPMuxDefault;
+use webrtc_ice::udp_mux::UDPMuxParams;
+use webrtc_ice::udp_network::UDPNetwork;
+
 use std::net::SocketAddr;
 
+use crate::error::Error;
 // use log::{debug, trace};
 // use std::{convert::TryInto, fmt, io, mem, pin::Pin, task::Context, task::Poll};
 // use url::Url;
 
 // A WebRTC connection.
 pub struct Connection<T> {
-    receiver: BoxStream<'static, Result<Incoming, connection::Error>>,
-    sender: Pin<Box<dyn Sink<Outgoing, Error = connection::Error> + Send>>,
+    // receiver: BoxStream<'static, Result<Incoming, connection::Error>>,
+    // sender: Pin<Box<dyn Sink<Outgoing, Error = connection::Error> + Send>>,
     _marker: std::marker::PhantomData<T>,
 }
 
 /// A WebRTC transport based on either TCP or UDP transport.
-#[derive(Debug, Clone)]
 pub struct WebRTCDirectTransport<T> {
+    pub config: RTCConfiguration,
+
     transport: T,
 }
 
@@ -56,8 +68,13 @@ impl<T> WebRTCDirectTransport<T> {
     /// Create a new transport based on the inner transport.
     ///
     /// See [`libp2p-tcp`](https://docs.rs/libp2p-tcp/) for constructing the inner transport.
-    pub fn new(transport: T) -> Self {
-        Self { transport }
+    pub fn new(transport: T, certificate: RTCCertificate) -> Self {
+        let config = RTCConfiguration {
+            certificates: vec![certificate],
+            ..Default::default()
+        };
+
+        Self { transport, config }
     }
 }
 
@@ -81,17 +98,33 @@ where
         let mut inner_addr = addr.clone();
 
         let proto = match inner_addr.pop() {
-            Some(p @ Protocol::XWebRtc(_)) => {
+            Some(p @ Protocol::XWebRtc(_)) => p,
             _ => {
                 debug!("{} is not a WebRTC multiaddr", addr);
                 return Err(TransportError::MultiaddrNotSupported(addr));
-            }
+            },
         };
 
         let transport = self
             .transport
             .listen_on(inner_addr)
             .map_err(|e| e.map(Error::Transport))?;
+
+        // Since all ICE traffic is always exchanged through UDP ([`UDPNetwork`]), when TCP
+        // transport is being used, we nonetheless need to listen on the UDP port (with the same
+        // number) for ICE messages.
+        let socket = if inner_addr.iter().any(|x| match x {
+            Protocol::Tcp(_) => true,
+            _ => false,
+        }) {
+            let socket_addr = multiaddr_to_socketaddr(&inner_addr)
+                .ok_or_else(|| TransportError::MultiaddrNotSupported(addr.clone()))?;
+            // TODO: use either tokio or async-io depending on feature flag
+            UdpSocket::bind(socket_addr)
+        } else {
+            // get socket from UDP transport?
+            // TODO
+        };
 
         let listen = transport
             .map_err(Error::Transport)
@@ -100,11 +133,11 @@ where
                     a = a.with(proto.clone());
                     debug!("Listening on {}", a);
                     ListenerEvent::NewAddress(a)
-                }
+                },
                 ListenerEvent::AddressExpired(mut a) => {
                     a = a.with(proto.clone());
                     ListenerEvent::AddressExpired(a)
-                }
+                },
                 ListenerEvent::Error(err) => ListenerEvent::Error(Error::Transport(err)),
                 ListenerEvent::Upgrade {
                     upgrade,
@@ -120,8 +153,30 @@ where
                         let stream = upgrade.map_err(Error::Transport).await?;
                         trace!("incoming connection from {}", remote1);
 
-                        // establish WebRTC conn
-                        
+                        let mut se = SettingEngine::default();
+
+                        // Disable remote's fingerprint verification.
+                        se.disable_certificate_fingerprint_verification(true);
+
+                        // Act as a lite ICE (ICE which does not send additional candidates).
+                        se.set_lite(true);
+
+                        // Set both ICE user and password to fingerprint.
+                        // It will be checked by remote side when exchanging ICE messages.
+                        se.set_ice_credentials("user".to_string(), "password".to_string());
+
+                        // Act as a DTLS server (wait for ClientHello message from the remote).
+                        se.set_answering_dtls_role(DTLSRole::Server)?;
+
+                        // UDP network is used for ICE traffic.
+                        se.set_udp_network(UDPNetwork::Muxed(UDPMuxDefault::new(
+                            UDPMuxParams::new(socket),
+                        )));
+
+                        let api = APIBuilder::new().with_setting_engine(se).build();
+
+                        let conn = api.new_peer_connection(self.config).await?;
+
                         Ok(conn)
                     };
 
@@ -130,7 +185,7 @@ where
                         local_addr,
                         remote_addr,
                     }
-                }
+                },
             });
         Ok(Box::pin(listen))
     }
@@ -176,7 +231,7 @@ fn multiaddr_to_socketaddr(addr: &Multiaddr) -> Option<SocketAddr> {
 
     while let Some(proto) = iter.next() {
         match proto {
-            Protocol::P2p(_) => {} // Ignore a `/p2p/...` prefix of possibly outer protocols, if present.
+            Protocol::P2p(_) => {}, // Ignore a `/p2p/...` prefix of possibly outer protocols, if present.
             _ => return None,
         }
     }
@@ -184,16 +239,16 @@ fn multiaddr_to_socketaddr(addr: &Multiaddr) -> Option<SocketAddr> {
     match (proto1, proto2, proto3) {
         (Protocol::Ip4(ip), Protocol::Udp(port), Protocol::P2pWebRtcDirect) => {
             Some(SocketAddr::new(ip.into(), port))
-        }
+        },
         (Protocol::Ip6(ip), Protocol::Udp(port), Protocol::P2pWebRtcDirect) => {
             Some(SocketAddr::new(ip.into(), port))
-        }
+        },
         (Protocol::Ip4(ip), Protocol::Tcp(port), Protocol::P2pWebRtcDirect) => {
             Some(SocketAddr::new(ip.into(), port))
-        }
+        },
         (Protocol::Ip6(ip), Protocol::Tcp(port), Protocol::P2pWebRtcDirect) => {
             Some(SocketAddr::new(ip.into(), port))
-        }
+        },
         _ => None,
     }
 }
