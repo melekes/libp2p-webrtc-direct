@@ -28,17 +28,19 @@ use libp2p_core::{
     Transport,
 };
 
+use async_std::sync::Arc;
 use bytes::Bytes;
 use futures::{future::BoxFuture, prelude::*, stream::BoxStream};
-
-use log::{debug, trace};
+use log::{debug, error, trace};
+use tokio::net::UdpSocket;
 use webrtc::api::setting_engine::SettingEngine;
+use webrtc::api::APIBuilder;
+use webrtc::data_channel::data_channel_message::DataChannelMessage;
+use webrtc::data_channel::RTCDataChannel;
 use webrtc::dtls_transport::dtls_role::DTLSRole;
 use webrtc::peer_connection::certificate::RTCCertificate;
 use webrtc::peer_connection::configuration::RTCConfiguration;
-// use webrtc::peer_connection::RTCPeerConnection;
-use tokio::net::UdpSocket;
-use webrtc::api::APIBuilder;
+use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc_ice::udp_mux::UDPMuxDefault;
 use webrtc_ice::udp_mux::UDPMuxParams;
 use webrtc_ice::udp_network::UDPNetwork;
@@ -46,9 +48,45 @@ use webrtc_ice::udp_network::UDPNetwork;
 use std::net::SocketAddr;
 
 use crate::error::Error;
-// use log::{debug, trace};
-// use std::{convert::TryInto, fmt, io, mem, pin::Pin, task::Context, task::Poll};
-// use url::Url;
+
+/// An SDP message that constitutes the offer.
+/// Main RFC: <https://datatracker.ietf.org/doc/html/rfc8866>
+/// `sctp-port` and `max-message-size` attrs RFC: <https://datatracker.ietf.org/doc/html/rfc8841>
+/// `group` and `mid` attrs RFC: <https://datatracker.ietf.org/doc/html/rfc9143>
+/// `ice-ufrag`, `ice-pwd` and `ice-options` attrs RFC: <https://datatracker.ietf.org/doc/html/rfc8839>
+/// `setup` attr RFC: <https://datatracker.ietf.org/doc/html/rfc8122>
+///
+/// Short description:
+///     v=<protocol-version>
+///     o=<username> <sess-id> <sess-version> <nettype> <addrtype> <unicast-address>
+///     s=<session name>
+///     c=<nettype> <addrtype> <connection-address>
+///     t=<start-time> <stop-time>
+///
+///     m=<media> <port> <proto> <fmt> ...
+///     a=mid:<MID>
+///     a=ice-options:ice2
+///     a=ice-ufrag:<ICE user>
+///     a=ice-pwd:<ICE password>
+///     a=setup:<setup>
+///     a=sctp-port:<value>
+///     a=max-message-size:<value>
+const CLIENT_SESSION_DESCRIPTION: &'static str = "v=0
+o=- 0 0 IN IP4 0.0.0.0
+s=-
+c=IN IP4 0.0.0.0
+t=0 0
+
+m=application 9 UDP/DTLS/SCTP webrtc-datachannel
+a=mid:0
+a=ice-options:ice2
+a=ice-ufrag:V6j+
+a=ice-pwd:OEKutPgoHVk/99FfqPOf444w
+a=fingerprint:sha-256 invalidFingerprint
+a=setup:actpass
+a=sctp-port:5000
+a=max-message-size:100000
+";
 
 // A WebRTC connection.
 pub struct Connection<T> {
@@ -151,7 +189,7 @@ where
 
                     let upgrade = async move {
                         let stream = upgrade.map_err(Error::Transport).await?;
-                        trace!("incoming connection from {}", remote1);
+                        trace!("Incoming connection from {}", remote1);
 
                         let mut se = SettingEngine::default();
 
@@ -175,9 +213,72 @@ where
 
                         let api = APIBuilder::new().with_setting_engine(se).build();
 
-                        let conn = api.new_peer_connection(self.config).await?;
+                        let peer_connection = api.new_peer_connection(self.config).await?;
 
-                        Ok(conn)
+                        peer_connection
+                            .on_peer_connection_state_change(Box::new(
+                                move |s: RTCPeerConnectionState| {
+                                    if s != RTCPeerConnectionState::Failed {
+                                        debug!("Peer Connection State has changed: {}", s);
+                                    } else {
+                                        // Wait until PeerConnection has had no network activity for 30 seconds or another
+                                        // failure. It may be reconnected using an ICE Restart. Use
+                                        // webrtc.PeerConnectionStateDisconnected if you are interested in detecting faster
+                                        // timeout. Note that the PeerConnection may come back from
+                                        // PeerConnectionStateDisconnected.
+                                        error!("Peer Connection has gone to failed => exiting");
+                                        // TODO: stop listening?
+                                    }
+
+                                    Box::pin(async {})
+                                },
+                            ))
+                            .await;
+
+                        peer_connection
+                            .on_data_channel(Box::new(move |d: Arc<RTCDataChannel>| {
+                                let d_label = d.label().to_owned();
+                                let d_id = d.id();
+                                debug!("New DataChannel {} {}", d_label, d_id);
+
+                                // Register channel opening handling
+                                Box::pin(async move {
+                                    let d2 = Arc::clone(&d);
+                                    let d_label2 = d_label.clone();
+                                    let d_id2 = d_id;
+                                    d.on_open(Box::new(move || {
+                                        debug!("Data channel '{}'-'{}' open", d_label2, d_id2);
+                                        Box::pin(async {})
+                                    }))
+                                    .await;
+
+                                    // Register text message handling
+                                    d.on_message(Box::new(move |msg: DataChannelMessage| {
+                                        let msg_str = String::from_utf8(msg.data.to_vec()).unwrap();
+                                        debug!(
+                                            "Message from DataChannel '{}': '{}'",
+                                            d_label, msg_str
+                                        );
+                                        Box::pin(async {})
+                                    }))
+                                    .await;
+                                })
+                            }))
+                            .await;
+
+                        // Set the remote description to the predefined SDP
+                        let mut offer = peer_connection.create_offer(None).await?;
+                        offer.sdp = CLIENT_SESSION_DESCRIPTION.to_string();
+                        debug!("REMOTE OFFER: {:?}", offer);
+                        peer_connection.set_remote_description(offer).await?;
+
+                        let answer = peer_connection.create_answer(None).await?;
+                        // Set the local description and start UDP listeners
+                        // Note: this will start the gathering of ICE candidates
+                        debug!("LOCAL ANSWER: {:?}", answer);
+                        peer_connection.set_local_description(answer).await?;
+
+                        Ok(peer_connection)
                     };
 
                     ListenerEvent::Upgrade {
