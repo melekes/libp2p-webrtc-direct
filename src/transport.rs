@@ -32,7 +32,6 @@ use async_std::sync::Arc;
 use bytes::Bytes;
 use futures::{future::BoxFuture, prelude::*, stream::BoxStream};
 use log::{debug, error, trace};
-use tokio::net::UdpSocket;
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
@@ -41,8 +40,7 @@ use webrtc::dtls_transport::dtls_role::DTLSRole;
 use webrtc::peer_connection::certificate::RTCCertificate;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
-use webrtc_ice::udp_mux::UDPMuxDefault;
-use webrtc_ice::udp_mux::UDPMuxParams;
+use webrtc_ice::udp_network::EphemeralUDP;
 use webrtc_ice::udp_network::UDPNetwork;
 
 use std::net::SocketAddr;
@@ -148,22 +146,6 @@ where
             .listen_on(inner_addr)
             .map_err(|e| e.map(Error::Transport))?;
 
-        // Since all ICE traffic is always exchanged through UDP ([`UDPNetwork`]), when TCP
-        // transport is being used, we nonetheless need to listen on the UDP port (with the same
-        // number) for ICE messages.
-        let socket = if inner_addr.iter().any(|x| match x {
-            Protocol::Tcp(_) => true,
-            _ => false,
-        }) {
-            let socket_addr = multiaddr_to_socketaddr(&inner_addr)
-                .ok_or_else(|| TransportError::MultiaddrNotSupported(addr.clone()))?;
-            // TODO: use either tokio or async-io depending on feature flag
-            UdpSocket::bind(socket_addr)
-        } else {
-            // get socket from UDP transport?
-            // TODO
-        };
-
         let listen = transport
             .map_err(Error::Transport)
             .map_ok(move |event| match event {
@@ -206,10 +188,18 @@ where
                         // Act as a DTLS server (wait for ClientHello message from the remote).
                         se.set_answering_dtls_role(DTLSRole::Server)?;
 
-                        // UDP network is used for ICE traffic.
-                        se.set_udp_network(UDPNetwork::Muxed(UDPMuxDefault::new(
-                            UDPMuxParams::new(socket),
-                        )));
+                        // UDP network ([`UDPNetwork`]) is used for ICE traffic.
+                        // Only one UDP port is needed because there's going to be just one
+                        // candidate. Hence `port_min` == `port_max`.
+                        //
+                        // In case of TCP transport, there will be two open ports (same number; one
+                        // for TCP and one for UDP).
+                        let socket_addr = multiaddr_to_socketaddr(&inner_addr)
+                            .ok_or_else(|| TransportError::MultiaddrNotSupported(addr.clone()))?;
+                        se.set_udp_network(UDPNetwork::Ephemeral(EphemeralUDP::new(
+                            socket_addr.port(),
+                            socket_addr.port(),
+                        )?));
 
                         let api = APIBuilder::new().with_setting_engine(se).build();
 
