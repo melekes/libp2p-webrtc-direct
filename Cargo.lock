@@ -1298,9 +1298,8 @@ checksum = "efaa7b300f3b5fe8eb6bf21ce3895e1751d9665086af2d64b42f19701015ff4f"
 
 [[package]]
 name = "libp2p-core"
-version = "0.32.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9164ec41455856e8187addc870bb4fe1ea2ee28e1a9244831d449a2429b32c1a"
+version = "0.32.1"
+source = "git+https://github.com/melekes/rust-libp2p?branch=anton/x-webrtc#eecff4070011de91174a4980fac5067687df0e87"
 dependencies = [
  "asn1_der",
  "bs58",
@@ -1440,13 +1439,13 @@ dependencies = [
 [[package]]
 name = "multiaddr"
 version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c580bfdd8803cce319b047d239559a22f809094aaea4ac13902a1fdcfcd4261"
+source = "git+https://github.com/melekes/rust-multiaddr?branch=anton/x-webrtc#c88f5f4cf1ad223fe4753f081a88d3ca31f44d63"
 dependencies = [
  "arrayref",
  "bs58",
  "byteorder",
  "data-encoding",
+ "hex",
  "multihash",
  "percent-encoding",
  "serde",
@@ -1491,8 +1490,7 @@ checksum = "e5ce46fe64a9d73be07dcbe690a38ce1b293be448fd8ce1e6c1b8062c9f72c6a"
 [[package]]
 name = "multistream-select"
 version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "363a84be6453a70e63513660f4894ef815daf88e3356bffcda9ca27d810ce83b"
+source = "git+https://github.com/melekes/rust-libp2p?branch=anton/x-webrtc#eecff4070011de91174a4980fac5067687df0e87"
 dependencies = [
  "bytes",
  "futures",

@@ -136,7 +136,7 @@ where
         let mut inner_addr = addr.clone();
 
         let proto = match inner_addr.pop() {
-            Some(p @ Protocol::XWebRtc(_)) => p,
+            Some(p @ Protocol::XWebRTC(_)) => p,
             _ => {
                 debug!("{} is not a WebRTC multiaddr", addr);
                 return Err(TransportError::MultiaddrNotSupported(addr));

@@ -19,7 +19,8 @@ either = "1.5.3"
 env_logger = "0.9.0"
 futures = "0.3.17"
 futures-rustls = "0.22"
-libp2p-core = { version = "0.32.0", default-features = false  }
+# TODO: update after the protocol is added to the main repo
+libp2p-core = { version = "0.32.0", default-features = false, git = "https://github.com/melekes/rust-libp2p", branch = "anton/x-webrtc"  }
 log = "0.4.14"
 quicksink = "0.1"
 rcgen = "0.8.14"
