@@ -18,35 +18,15 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-use libp2p_core::Multiaddr;
-
-use std::{error, fmt};
+use thiserror::Error;
 
 /// Error in WebRTC.
-#[derive(Debug)]
+#[derive(Error, Debug)]
 pub enum Error<E> {
-    /// Error in the transport layer underneath.
-    Transport(E),
-    /// A multi-address is not supported.
-    InvalidMultiaddr(Multiaddr),
-}
-
-impl<E: fmt::Display> fmt::Display for Error<E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Transport(err) => write!(f, "{}", err),
-            Error::InvalidMultiaddr(ma) => {
-                write!(f, "invalid multi-address: {}", ma)
-            },
-        }
-    }
-}
-
-impl<E: error::Error + 'static> error::Error for Error<E> {
-    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        match self {
-            Error::Transport(err) => Some(err),
-            Error::InvalidMultiaddr(_) => None,
-        }
-    }
+    #[error("transport error: {0}")]
+    Transport(#[source] E),
+    #[error("multi-address {0} is not supported")]
+    InvalidMultiaddr(libp2p_core::Multiaddr),
+    #[error("webrtc error: {0}")]
+    WebRTC(#[from] webrtc::Error),
 }

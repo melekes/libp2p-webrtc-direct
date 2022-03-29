@@ -33,3 +33,7 @@ webpki-roots = "0.22"
 webrtc = { version = "0.4.0", git = "https://github.com/melekes/webrtc", branch = "anton/168-allow-persistent-certificates" }
 webrtc-dtls = "0.5.2"
 webrtc-ice = "0.6.6"
+thiserror = "1"
+tinytemplate = "1.2"
+serde = { version = "1.0", features = ["derive"] }
+hex = "0.4"
