@@ -48,6 +48,7 @@ use webrtc::peer_connection::RTCPeerConnection;
 use webrtc_ice::udp_network::EphemeralUDP;
 use webrtc_ice::udp_network::UDPNetwork;
 
+use std::borrow::Cow;
 use std::marker::PhantomData;
 
 use crate::error::Error;
@@ -60,20 +61,21 @@ use crate::error::Error;
 /// `setup` attr RFC: <https://datatracker.ietf.org/doc/html/rfc8122>
 ///
 /// Short description:
-///     v=<protocol-version>
-///     o=<username> <sess-id> <sess-version> <nettype> <addrtype> <unicast-address>
-///     s=<session name>
-///     c=<nettype> <addrtype> <connection-address>
-///     t=<start-time> <stop-time>
 ///
-///     m=<media> <port> <proto> <fmt> ...
-///     a=mid:<MID>
-///     a=ice-options:ice2
-///     a=ice-ufrag:<ICE user>
-///     a=ice-pwd:<ICE password>
-///     a=setup:<setup>
-///     a=sctp-port:<value>
-///     a=max-message-size:<value>
+/// v=<protocol-version>
+/// o=<username> <sess-id> <sess-version> <nettype> <addrtype> <unicast-address>
+/// s=<session name>
+/// c=<nettype> <addrtype> <connection-address>
+/// t=<start-time> <stop-time>
+///
+/// m=<media> <port> <proto> <fmt> ...
+/// a=mid:<MID>
+/// a=ice-options:ice2
+/// a=ice-ufrag:<ICE user>
+/// a=ice-pwd:<ICE password>
+/// a=setup:<setup>
+/// a=sctp-port:<value>
+/// a=max-message-size:<value>
 const CLIENT_SESSION_DESCRIPTION: &'static str = "v=0
 o=- 0 0 IN IP4 0.0.0.0
 s=-
@@ -180,8 +182,8 @@ enum IpVersion {
     IP6,
 }
 
-#[derive(Serialize)]
-enum TransportProtocol {
+#[derive(Debug, Serialize, PartialEq)]
+pub enum TransportProtocol {
     TCP,
     UDP,
 }
@@ -280,40 +282,20 @@ where
                     local_addr = local_addr.with(proto.clone());
                     remote_addr = remote_addr.with(proto.clone());
                     let remote = remote_addr.clone(); // used for logging
+                    let config = self.config.clone();
 
                     let upgrade = async move {
                         let _stream = upgrade.map_err(Error::Transport).await?;
                         trace!("Incoming connection from {}", remote);
 
-                        let mut se = SettingEngine::default();
-
-                        // Disable remote's fingerprint verification.
-                        se.disable_certificate_fingerprint_verification(true);
-
-                        // Act as a lite ICE (ICE which does not send additional candidates).
-                        se.set_lite(true);
-
-                        // Set both ICE user and password to fingerprint.
-                        // It will be checked by remote side when exchanging ICE messages.
-                        se.set_ice_credentials("user".to_string(), "password".to_string());
+                        let mut se = build_settings(&socket_addr)?;
 
                         // Act as a DTLS server (wait for ClientHello message from the remote).
                         se.set_answering_dtls_role(DTLSRole::Server)?;
 
-                        // UDP network ([`UDPNetwork`]) is used for ICE traffic.
-                        // Only one UDP port is needed because there's going to be just one
-                        // candidate. Hence `port_min` == `port_max`.
-                        //
-                        // In case of TCP transport, there will be two open ports (same number; one
-                        // for TCP and one for UDP).
-                        se.set_udp_network(UDPNetwork::Ephemeral(
-                            EphemeralUDP::new(socket_addr.port(), socket_addr.port())
-                                .map_err(|e| Error::WebRTC(webrtc::Error::Ice(e)))?,
-                        ));
-
                         let api = APIBuilder::new().with_setting_engine(se).build();
 
-                        let peer_connection = api.new_peer_connection(self.config).await?;
+                        let peer_connection = api.new_peer_connection(config).await?;
 
                         peer_connection
                             .on_peer_connection_state_change(Box::new(
@@ -453,6 +435,7 @@ where
         };
         let server_session_description = tt.render("description", &context).unwrap();
 
+        let config = self.config.clone();
         let future = async move {
             let remote = addr.clone(); // used for logging
 
@@ -470,41 +453,20 @@ where
             let _stream = dial.map_err(Error::Transport).await?;
             trace!("transport connection to {} established", remote);
 
-            // TODO: dedup!
-            let mut se = SettingEngine::default();
-
-            // Disable remote's fingerprint verification.
-            se.disable_certificate_fingerprint_verification(true);
-
-            // Act as a lite ICE (ICE which does not send additional candidates).
-            se.set_lite(true);
-
-            // Set both ICE user and password to fingerprint.
-            // It will be checked by remote side when exchanging ICE messages.
-            se.set_ice_credentials("user".to_string(), "password".to_string());
+            let mut se = build_settings(&socket_addr)?;
 
             // Act as a DTLS server (wait for ClientHello message from the remote).
             se.set_answering_dtls_role(DTLSRole::Client)
                 .map_err(Error::WebRTC)?;
 
-            // UDP network ([`UDPNetwork`]) is used for ICE traffic.
-            // Only one UDP port is needed because there's going to be just one
-            // candidate. Hence `port_min` == `port_max`.
-            //
-            // In case of TCP transport, there will be two open ports (same number; one
-            // for TCP and one for UDP).
-            se.set_udp_network(UDPNetwork::Ephemeral(
-                EphemeralUDP::new(socket_addr.port(), socket_addr.port())
-                    .map_err(|e| Error::WebRTC(webrtc::Error::Ice(e)))?,
-            ));
-
             let api = APIBuilder::new().with_setting_engine(se).build();
 
             let peer_connection = api
-                .new_peer_connection(self.config)
+                .new_peer_connection(config)
                 .map_err(Error::WebRTC)
                 .await?;
 
+            // TODO: dedup
             peer_connection
                 .on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
                     if s != RTCPeerConnectionState::Failed {
@@ -617,19 +579,46 @@ fn multiaddr_to_socketaddr(addr: &Multiaddr) -> Option<(SocketAddr, TransportPro
 }
 
 /// Turns an IP address and port into the corresponding WebRTC multiaddr.
-pub(crate) fn socketaddr_to_multiaddr(
+pub(crate) fn socketaddr_to_multiaddr<'a>(
     socket_addr: &SocketAddr,
-    transport_protocol: &str,
+    transport_protocol: TransportProtocol,
+    fingerprint: Cow<'a, [u8; 32]>,
 ) -> Multiaddr {
     let p = match transport_protocol {
-        "udp" => Protocol::Udp(socket_addr.port()),
-        "tcp" => Protocol::Tcp(socket_addr.port()),
-        _ => panic!("unsupported protocol: {}", transport_protocol),
+        TransportProtocol::UDP => Protocol::Udp(socket_addr.port()),
+        TransportProtocol::TCP => Protocol::Tcp(socket_addr.port()),
     };
     Multiaddr::empty()
         .with(socket_addr.ip().into())
         .with(p)
-        .with(Protocol::P2pWebRtcDirect)
+        .with(Protocol::XWebRTC(fingerprint))
+}
+
+fn build_settings<E>(socket_addr: &SocketAddr) -> Result<SettingEngine, Error<E>> {
+    let mut se = SettingEngine::default();
+
+    // Disable remote's fingerprint verification.
+    se.disable_certificate_fingerprint_verification(true);
+
+    // Act as a lite ICE (ICE which does not send additional candidates).
+    se.set_lite(true);
+
+    // Set both ICE user and password to fingerprint.
+    // It will be checked by remote side when exchanging ICE messages.
+    se.set_ice_credentials("user".to_string(), "password".to_string());
+
+    // UDP network ([`UDPNetwork`]) is used for ICE traffic.
+    // Only one UDP port is needed because there's going to be just one
+    // candidate. Hence `port_min` == `port_max`.
+    //
+    // In case of TCP transport, there will be two open ports (same number; one
+    // for TCP and one for UDP).
+    se.set_udp_network(UDPNetwork::Ephemeral(
+        EphemeralUDP::new(socket_addr.port(), socket_addr.port())
+            .map_err(|e| Error::WebRTC(webrtc::Error::Ice(e)))?,
+    ));
+
+    Ok(se)
 }
 
 // Tests //////////////////////////////////////////////////////////////////////////////////////////
@@ -649,30 +638,30 @@ mod tests {
 
         assert_eq!(
             multiaddr_to_socketaddr(
-                &"/ip4/127.0.0.1/tcp/12345/x-webrtc/AC:D1:E5:33:EC:27:1F:CD:E0:27:59:47:F4:D6:2A:2B:23:31:FF:10:C9:DD:E0:29:8E:B7:B3:99:B4:BF:F6:0B"
+                &"/ip4/127.0.0.1/tcp/12345/x-webrtc/ACD1E533EC271FCDE0275947F4D62A2B2331FF10C9DDE0298EB7B399B4BFF60B"
                     .parse::<Multiaddr>()
                     .unwrap()
             ),
-            Some(SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-                12345,
-            ))
+            Some(( SocketAddr::new(
+                        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                        12345,
+            ), TransportProtocol::TCP ))
         );
 
         assert_eq!(
             multiaddr_to_socketaddr(
-                &"/ip4/127.0.0.1/tcp/12345/x-webrtc/AC:D1:E5:33:EC:27:1F:CD:E0:27:59:47:F4:D6:2A:2B:23:31:FF:10:C9:DD:E0:29:8E:B7:B3:99:B4:BF:F6:0B"
+                &"/ip4/127.0.0.1/tcp/12345/x-webrtc/ACD1E533EC271FCDE0275947F4D62A2B2331FF10C9DDE0298EB7B399B4BFF60B"
                     .parse::<Multiaddr>()
                     .unwrap()
             ),
-            Some(SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-                12345,
-            ))
+            Some(( SocketAddr::new(
+                        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                        12345,
+            ), TransportProtocol::TCP ))
         );
 
         assert!(multiaddr_to_socketaddr(
-            &"/ip4/127.0.0.1/udp/12345/x-webrtc/AC/tcp/12345"
+            &"/ip4/127.0.0.1/udp/12345/x-webrtc/ACD1E533EC271FCDE0275947F4D62A2B2331FF10C9DDE0298EB7B399B4BFF60B/tcp/12345"
                 .parse::<Multiaddr>()
                 .unwrap()
         )
@@ -680,39 +669,45 @@ mod tests {
 
         assert_eq!(
             multiaddr_to_socketaddr(
-                &"/ip4/255.255.255.255/udp/8080/x-webrtc/AC:D1:E5:33:EC:27:1F:CD:E0:27:59:47:F4:D6:2A:2B:23:31:FF:10:C9:DD:E0:29:8E:B7:B3:99:B4:BF:F6:0B"
+                &"/ip4/255.255.255.255/udp/8080/x-webrtc/ACD1E533EC271FCDE0275947F4D62A2B2331FF10C9DDE0298EB7B399B4BFF60B"
                     .parse::<Multiaddr>()
                     .unwrap()
             ),
-            Some(SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)),
-                8080,
-            ))
+            Some(( SocketAddr::new(
+                        IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)),
+                        8080,
+            ), TransportProtocol::UDP ))
         );
         assert_eq!(
             multiaddr_to_socketaddr(
-                &"/ip6/::1/udp/12345/x-webrtc/AC:D1:E5:33:EC:27:1F:CD:E0:27:59:47:F4:D6:2A:2B:23:31:FF:10:C9:DD:E0:29:8E:B7:B3:99:B4:BF:F6:0B"
+                &"/ip6/::1/udp/12345/x-webrtc/ACD1E533EC271FCDE0275947F4D62A2B2331FF10C9DDE0298EB7B399B4BFF60B"
                     .parse::<Multiaddr>()
                     .unwrap()
             ),
-            Some(SocketAddr::new(
-                IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)),
-                12345,
-            ))
+            Some(( SocketAddr::new(
+                        IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)),
+                        12345,
+            ), TransportProtocol::UDP ))
         );
         assert_eq!(
             multiaddr_to_socketaddr(
-                &"/ip6/ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff/tcp/8080/x-webrtc/AC:D1:E5:33:EC:27:1F:CD:E0:27:59:47:F4:D6:2A:2B:23:31:FF:10:C9:DD:E0:29:8E:B7:B3:99:B4:BF:F6:0B"
+                &"/ip6/ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff/tcp/8080/x-webrtc/ACD1E533EC271FCDE0275947F4D62A2B2331FF10C9DDE0298EB7B399B4BFF60B"
                     .parse::<Multiaddr>()
                     .unwrap()
             ),
-            Some(SocketAddr::new(
-                IpAddr::V6(Ipv6Addr::new(
-                    65535, 65535, 65535, 65535, 65535, 65535, 65535, 65535,
-                )),
-                8080,
-            ))
+            Some(( SocketAddr::new(
+                        IpAddr::V6(Ipv6Addr::new(
+                                65535, 65535, 65535, 65535, 65535, 65535, 65535, 65535,
+                        )),
+                        8080,
+            ), TransportProtocol::TCP ))
         );
+    }
+
+    fn hex_to_cow<'a>(s: &str) -> Cow<'a, [u8; 32]> {
+        let mut buf = [0; 32];
+        hex::decode_to_slice(s, &mut buf).unwrap();
+        Cow::Owned(buf)
     }
 
     #[test]
@@ -720,9 +715,10 @@ mod tests {
         assert_eq!(
             socketaddr_to_multiaddr(
                 &SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345,),
-                "tcp"
+                TransportProtocol::TCP,
+                hex_to_cow("ACD1E533EC271FCDE0275947F4D62A2B2331FF10C9DDE0298EB7B399B4BFF60B"),
             ),
-            "/ip4/127.0.0.1/tcp/12345/x-webrtc/AC:D1:E5:33:EC:27:1F:CD:E0:27:59:47:F4:D6:2A:2B:23:31:FF:10:C9:DD:E0:29:8E:B7:B3:99:B4:BF:F6:0B"
+            "/ip4/127.0.0.1/tcp/12345/x-webrtc/ACD1E533EC271FCDE0275947F4D62A2B2331FF10C9DDE0298EB7B399B4BFF60B"
                 .parse::<Multiaddr>()
                 .unwrap()
         );
