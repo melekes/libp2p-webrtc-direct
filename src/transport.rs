@@ -18,9 +18,6 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-//! Implementation of the [`Transport`] trait for WebRTC (direct communication without a signaling
-//! server).
-
 use libp2p_core::{
     connection::Endpoint,
     multiaddr::{Multiaddr, Protocol},
