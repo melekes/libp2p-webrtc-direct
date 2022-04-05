@@ -32,20 +32,69 @@ use std::net::IpAddr;
 ///
 /// Short description:
 ///
-/// v=<protocol-version>
+/// v=<protocol-version> -> always 0
 /// o=<username> <sess-id> <sess-version> <nettype> <addrtype> <unicast-address>
+///
+///     <username> identifies the creator of the SDP document. We are allowed to use dummy values
+///     (`-` and `0.0.0.0` as <addrtype>) to remain anonymous, which we do. Note that "IN" means
+///     "Internet".
+///
 /// s=<session name>
+///
+///     We are allowed to pass a dummy `-`.
+///
 /// c=<nettype> <addrtype> <connection-address>
+///
+///     Indicates the IP address of the remote.
+///     Note that "IN" means "Internet".
+///
 /// t=<start-time> <stop-time>
 ///
+///     Start and end of the validity of the session. `0 0` means that the session never expires.
+///
 /// m=<media> <port> <proto> <fmt> ...
+///
+///     A `m=` line describes a request to establish a certain protocol. The protocol in this line
+///     (i.e. `TCP/DTLS/SCTP` or `UDP/DTLS/SCTP`) must always be the same as the one in the offer.
+///     We know that this is true because we tweak the offer to match the protocol. The `<fmt>`
+///     component must always be `webrtc-datachannel` for WebRTC.
+///     RFCs: 8839, 8866, 8841
+///
 /// a=mid:<MID>
+///
+///     Media ID - uniquely identifies this media stream (RFC9143).
+///
 /// a=ice-options:ice2
+///
+///     Indicates that we are complying with RFC8839 (as oppposed to the legacy RFC5245).
+///
 /// a=ice-ufrag:<ICE user>
 /// a=ice-pwd:<ICE password>
-/// a=setup:<setup>
+///
+///     ICE username and password, which are used for establishing and
+///     maintaining the ICE connection. (RFC8839)
+///     MUST match ones used by the answerer (server).
+///
+/// a=fingerprint:sha-256 <fingerprint>
+///
+///     Fingerprint of the certificate that the remote will use during the TLS
+///     handshake. (RFC8122)
+///     TODO: do we verify fingerprint here?
+///
+/// a=setup:actpass
+///
+///     The endpoint that is the offerer MUST use the setup attribute value of setup:actpass and be
+///     prepared to receive a client_hello before it receives the answer.
+///     
 /// a=sctp-port:<value>
+///
+///     The SCTP port (RFC8841)
+///     Note it's different from the "m=" line port value, which indicates the port of the
+///     underlying transport-layer protocol (UDP or TCP).
+///
 /// a=max-message-size:<value>
+///
+///     The maximum SCTP user message size (in bytes). (RFC8841)
 const CLIENT_SESSION_DESCRIPTION: &'static str = "v=0
 o=- 0 0 IN IP4 0.0.0.0
 s=-
@@ -63,70 +112,42 @@ a=sctp-port:5000
 a=max-message-size:100000
 ";
 
-// Version of the SDP protocol. Always 0. (RFC8866)
-//
-// Identifies the creator of the SDP document. We are allowed to use dummy values
-// (`-` and `0.0.0.0`) to remain anonymous, which we do. Note that "IN" means
-// "Internet". (RFC8866)
-//
-// Name for the session. We are allowed to pass a dummy `-`. (RFC8866)
-//
-// Start and end of the validity of the session. `0 0` means that the session never
-// expires. (RFC8866)
-//
-// A lite implementation is only appropriate for devices that will
-// *always* be connected to the public Internet and have a public
-// IP address at which it can receive packets from any
-// correspondent.  ICE will not function when a lite implementation
-// is placed behind a NAT (RFC8445).
-//
-// A `m=` line describes a request to establish a certain protocol.
-// The protocol in this line (i.e. `TCP/DTLS/SCTP` or `UDP/DTLS/SCTP`) must always be
-// the same as the one in the offer. We know that this is true because we tweak the
-// offer to match the protocol.
-// The `<fmt>` component must always be `pc-datachannel` for WebRTC.
-// The rest of the SDP payload adds attributes to this specific media stream.
-// RFCs: 8839, 8866, 8841
-//
-// Indicates the IP address of the remote.
-// Note that "IN" means "Internet".
-//
-// Media ID - uniquely identifies this media stream (RFC9143).
-//
-// Indicates that we are complying with RFC8839 (as oppposed to the legacy RFC5245).
-//
-// ICE username and password, which are used for establishing and
-// maintaining the ICE connection. (RFC8839)
-// MUST match ones used by the answerer (server).
-//
-// Fingerprint of the certificate that the server will use during the TLS
-// handshake. (RFC8122)
-// As explained at the top-level documentation, we use a hardcoded certificate.
-// MUST be derived from the certificate used by the answerer (server).
-// TODO: proper certificate and fingerprint
-//
-// "TLS ID" uniquely identifies a TLS association.
-// The ICE protocol uses a "TLS ID" system to indicate whether a fresh DTLS connection
-// must be reopened in case of ICE renegotiation. Considering that ICE renegotiations
-// never happen in our use case, we can simply put a random value and not care about
-// it. Note however that the TLS ID in the answer must be present if and only if the
-// offer contains one. (RFC8842)
-// TODO: is it true that renegotiations never happen? what about a connection closing?
-// TODO: right now browsers don't send it "a=tls-id:" + genRandomPayload(120) + "\n" +
-// "tls-id" attribute MUST be present in the initial offer and respective answer (RFC8839).
-//
-// Indicates that the remote DTLS server will only listen for incoming
-// connections. (RFC5763)
-// The answerer (server) MUST not be located behind a NAT (RFC6135).
-//
-// The SCTP port (RFC8841)
-// Note it's different from the "m=" line port value, which
-// indicates the port of the underlying transport-layer protocol
-// (UDP or TCP)
-//
-// The maximum SCTP user message size (in bytes) (RFC8841)
-//
-// A transport address for a candidate that can be used for connectivity checks (RFC8839).
+/// See [`CLIENT_SESSION_DESCRIPTION`].
+///
+/// a=ice-lite
+///
+///     A lite implementation is only appropriate for devices that will *always* be connected to
+///     the public Internet and have a public IP address at which it can receive packets from any
+///     correspondent. ICE will not function when a lite implementation is placed behind a NAT
+///     (RFC8445).
+///
+/// a=tls-id:<id>
+///
+///     "TLS ID" uniquely identifies a TLS association.
+///     The ICE protocol uses a "TLS ID" system to indicate whether a fresh DTLS connection
+///     must be reopened in case of ICE renegotiation. Considering that ICE renegotiations
+///     never happen in our use case, we can simply put a random value and not care about
+///     it. Note however that the TLS ID in the answer must be present if and only if the
+///     offer contains one. (RFC8842)
+///     TODO: is it true that renegotiations never happen? what about a connection closing?
+///     TODO: right now browsers don't send it "a=tls-id:" + genRandomPayload(120) + "\n" +
+///     "tls-id" attribute MUST be present in the initial offer and respective answer (RFC8839).
+///
+/// a=setup:passive
+///
+///     "passive" indicates that the remote DTLS server will only listen for incoming
+///     connections. (RFC5763)
+///     The answerer (server) MUST not be located behind a NAT (RFC6135).
+///
+///     The answerer MUST use either a setup attribute value of setup:active or setup:passive.
+///     Note that if the answerer uses setup:passive, then the DTLS handshake will not begin until
+///     the answerer is received, which adds additional latency. setup:active allows the answer and
+///     the DTLS handshake to occur in parallel. Thus, setup:active is RECOMMENDED.
+///     TODO: should we use active setup?
+///
+/// a=candidate:<foundation> <component-id> <transport> <priority> <connection-address> <port> <cand-type>
+///
+///     A transport address for a candidate that can be used for connectivity checks (RFC8839).
 pub const SERVER_SESSION_DESCRIPTION: &'static str = "v=0
 o=- 0 0 IN IP {IP_VERSION} {TARGET_IP}
 s=-
