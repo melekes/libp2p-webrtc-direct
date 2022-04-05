@@ -91,22 +91,6 @@ pub struct Connection {
 pub struct WebRTCDirectTransport {
     config: RTCConfiguration,
     udp_mux: Arc<dyn UDPMux + Send + Sync>,
-
-    /// The socket address that the listening socket is bound to,
-    /// which may be a "wildcard address" like `INADDR_ANY` or `IN6ADDR_ANY`
-    /// when listening on all interfaces for IPv4 respectively IPv6 connections.
-    listen_addr: SocketAddr,
-    /// The IP addresses of network interfaces on which the listening socket
-    /// is accepting connections.
-    ///
-    /// If the listen socket listens on all interfaces, these may change over
-    /// time as interfaces become available or unavailable.
-    in_addr: InAddr,
-    /// How long to sleep after a (non-fatal) error while trying
-    /// to accept a new connection.
-    sleep_on_error: Duration,
-    /// The current pause, if any.
-    pause: Option<Delay>,
 }
 
 impl WebRTCDirectTransport {
@@ -129,45 +113,16 @@ impl WebRTCDirectTransport {
             .map_err(Error::IoError)
             .map_err(TransportError::Other)
             .await?;
-        let local_addr = socket
-            .local_addr()
-            .map_err(Error::IoError)
-            .map_err(TransportError::Other)?;
         let udp_mux = UDPMuxDefault::new(UDPMuxParams::new(socket));
 
-        // Check whether the listening IP is set or not.
-        let in_addr = if match &local_addr {
-            SocketAddr::V4(a) => a.ip().is_unspecified(),
-            SocketAddr::V6(a) => a.ip().is_unspecified(),
-        } {
-            // The `addrs` are populated via `if_watch` when the
-            // `WebRTCDirectTransport` is polled.
-            InAddr::Any {
-                if_watch: IfWatch::Pending(IfWatcher::new().boxed()),
-            }
-        } else {
-            InAddr::One {
-                out: Some(ip_to_multiaddr(local_addr.ip(), local_addr.port())),
-                addr: local_addr.ip(),
-            }
-        };
-
-        Ok(Self {
-            config,
-            udp_mux,
-            listen_addr: local_addr,
-            in_addr,
-            pause: None,
-            sleep_on_error: Duration::from_millis(100),
-        })
+        Ok(Self { config, udp_mux })
     }
 }
 
 impl Transport for WebRTCDirectTransport {
     type Output = Connection;
     type Error = Error;
-    type Listener =
-        BoxStream<'static, Result<ListenerEvent<Self::ListenerUpgrade, Self::Error>, Self::Error>>;
+    type Listener = WebRTCListenStream;
     type ListenerUpgrade = BoxFuture<'static, Result<Self::Output, Self::Error>>;
     type Dial = BoxFuture<'static, Result<Self::Output, Self::Error>>;
 
@@ -176,7 +131,7 @@ impl Transport for WebRTCDirectTransport {
             .ok_or_else(|| TransportError::MultiaddrNotSupported(addr))?;
         log::debug!("listening on {}", socket_addr);
 
-        Ok(Box::pin(self))
+        Ok(WebRTCListenStream::new(socket_addr))
     }
 
     fn dial(self, addr: Multiaddr) -> Result<Self::Dial, TransportError<Self::Error>> {
@@ -192,7 +147,56 @@ impl Transport for WebRTCDirectTransport {
     }
 }
 
-impl Stream for WebRTCDirectTransport {
+/// A stream of incoming connections on one or more interfaces.
+pub struct WebRTCListenStream {
+    /// The socket address that the listening socket is bound to,
+    /// which may be a "wildcard address" like `INADDR_ANY` or `IN6ADDR_ANY`
+    /// when listening on all interfaces for IPv4 respectively IPv6 connections.
+    listen_addr: SocketAddr,
+    /// The IP addresses of network interfaces on which the listening socket
+    /// is accepting connections.
+    ///
+    /// If the listen socket listens on all interfaces, these may change over
+    /// time as interfaces become available or unavailable.
+    in_addr: InAddr,
+    /// How long to sleep after a (non-fatal) error while trying
+    /// to accept a new connection.
+    sleep_on_error: Duration,
+    /// The current pause, if any.
+    pause: Option<Delay>,
+}
+
+impl WebRTCListenStream {
+    /// Constructs a `WebRTCListenStream` for incoming connections around
+    /// the given `TcpListener`.
+    fn new(listen_addr: SocketAddr) -> Self {
+        // Check whether the listening IP is set or not.
+        let in_addr = if match &listen_addr {
+            SocketAddr::V4(a) => a.ip().is_unspecified(),
+            SocketAddr::V6(a) => a.ip().is_unspecified(),
+        } {
+            // The `addrs` are populated via `if_watch` when the
+            // `WebRTCDirectTransport` is polled.
+            InAddr::Any {
+                if_watch: IfWatch::Pending(IfWatcher::new().boxed()),
+            }
+        } else {
+            InAddr::One {
+                out: Some(ip_to_multiaddr(listen_addr.ip(), listen_addr.port())),
+                addr: listen_addr.ip(),
+            }
+        };
+
+        WebRTCListenStream {
+            listen_addr,
+            in_addr,
+            pause: None,
+            sleep_on_error: Duration::from_millis(100),
+        }
+    }
+}
+
+impl Stream for WebRTCListenStream {
     type Item = Result<ListenerEvent<BoxFuture<'static, Result<Connection, Error>>, Error>, Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
