@@ -31,7 +31,6 @@ use futures::{future::BoxFuture, prelude::*, ready, stream::BoxStream};
 use futures_timer::Delay;
 use if_watch::{IfEvent, IfWatcher};
 use log::{debug, error, trace};
-use serde::Serialize;
 use tinytemplate::TinyTemplate;
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
@@ -63,143 +62,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use crate::error::Error;
-
-/// An SDP message that constitutes the offer.
-/// Main RFC: <https://datatracker.ietf.org/doc/html/rfc8866>
-/// `sctp-port` and `max-message-size` attrs RFC: <https://datatracker.ietf.org/doc/html/rfc8841>
-/// `group` and `mid` attrs RFC: <https://datatracker.ietf.org/doc/html/rfc9143>
-/// `ice-ufrag`, `ice-pwd` and `ice-options` attrs RFC: <https://datatracker.ietf.org/doc/html/rfc8839>
-/// `setup` attr RFC: <https://datatracker.ietf.org/doc/html/rfc8122>
-///
-/// Short description:
-///
-/// v=<protocol-version>
-/// o=<username> <sess-id> <sess-version> <nettype> <addrtype> <unicast-address>
-/// s=<session name>
-/// c=<nettype> <addrtype> <connection-address>
-/// t=<start-time> <stop-time>
-///
-/// m=<media> <port> <proto> <fmt> ...
-/// a=mid:<MID>
-/// a=ice-options:ice2
-/// a=ice-ufrag:<ICE user>
-/// a=ice-pwd:<ICE password>
-/// a=setup:<setup>
-/// a=sctp-port:<value>
-/// a=max-message-size:<value>
-const CLIENT_SESSION_DESCRIPTION: &'static str = "v=0
-o=- 0 0 IN IP4 0.0.0.0
-s=-
-c=IN IP4 0.0.0.0
-t=0 0
-
-m=application 9 UDP/DTLS/SCTP webrtc-datachannel
-a=mid:0
-a=ice-options:ice2
-a=ice-ufrag:user
-a=ice-pwd:password
-a=fingerprint:sha-256 invalidFingerprint
-a=setup:actpass
-a=sctp-port:5000
-a=max-message-size:100000
-";
-
-// Version of the SDP protocol. Always 0. (RFC8866)
-//
-// Identifies the creator of the SDP document. We are allowed to use dummy values
-// (`-` and `0.0.0.0`) to remain anonymous, which we do. Note that "IN" means
-// "Internet". (RFC8866)
-//
-// Name for the session. We are allowed to pass a dummy `-`. (RFC8866)
-//
-// Start and end of the validity of the session. `0 0` means that the session never
-// expires. (RFC8866)
-//
-// A lite implementation is only appropriate for devices that will
-// *always* be connected to the public Internet and have a public
-// IP address at which it can receive packets from any
-// correspondent.  ICE will not function when a lite implementation
-// is placed behind a NAT (RFC8445).
-//
-// A `m=` line describes a request to establish a certain protocol.
-// The protocol in this line (i.e. `TCP/DTLS/SCTP` or `UDP/DTLS/SCTP`) must always be
-// the same as the one in the offer. We know that this is true because we tweak the
-// offer to match the protocol.
-// The `<fmt>` component must always be `pc-datachannel` for WebRTC.
-// The rest of the SDP payload adds attributes to this specific media stream.
-// RFCs: 8839, 8866, 8841
-//
-// Indicates the IP address of the remote.
-// Note that "IN" means "Internet".
-//
-// Media ID - uniquely identifies this media stream (RFC9143).
-//
-// Indicates that we are complying with RFC8839 (as oppposed to the legacy RFC5245).
-//
-// ICE username and password, which are used for establishing and
-// maintaining the ICE connection. (RFC8839)
-// MUST match ones used by the answerer (server).
-//
-// Fingerprint of the certificate that the server will use during the TLS
-// handshake. (RFC8122)
-// As explained at the top-level documentation, we use a hardcoded certificate.
-// MUST be derived from the certificate used by the answerer (server).
-// TODO: proper certificate and fingerprint
-//
-// "TLS ID" uniquely identifies a TLS association.
-// The ICE protocol uses a "TLS ID" system to indicate whether a fresh DTLS connection
-// must be reopened in case of ICE renegotiation. Considering that ICE renegotiations
-// never happen in our use case, we can simply put a random value and not care about
-// it. Note however that the TLS ID in the answer must be present if and only if the
-// offer contains one. (RFC8842)
-// TODO: is it true that renegotiations never happen? what about a connection closing?
-// TODO: right now browsers don't send it "a=tls-id:" + genRandomPayload(120) + "\n" +
-// "tls-id" attribute MUST be present in the initial offer and respective answer (RFC8839).
-//
-// Indicates that the remote DTLS server will only listen for incoming
-// connections. (RFC5763)
-// The answerer (server) MUST not be located behind a NAT (RFC6135).
-//
-// The SCTP port (RFC8841)
-// Note it's different from the "m=" line port value, which
-// indicates the port of the underlying transport-layer protocol
-// (UDP or TCP)
-//
-// The maximum SCTP user message size (in bytes) (RFC8841)
-//
-// A transport address for a candidate that can be used for connectivity checks (RFC8839).
-const SERVER_SESSION_DESCRIPTION: &'static str = "v=0
-o=- 0 0 IN IP {IP_VERSION} {TARGET_IP}
-s=-
-t=0 0
-a=ice-lite
-m=application {TARGET_PORT} UDP/DTLS/SCTP webrtc-datachannel
-c=IN IP {IP_VERSION} {TARGET_IP}
-a=mid:0
-a=ice-options:ice2
-a=ice-ufrag:user
-a=ice-pwd:password
-a=fingerprint:sha-256 {FINGERPRINT}
-
-a=setup:passive
-a=sctp-port:5000
-a=max-message-size:100000
-a=candidate:1 1 UDP 2113667327 {TARGET_IP} {TARGET_PORT} typ host
-";
-
-#[derive(Serialize)]
-enum IpVersion {
-    IP4,
-    IP6,
-}
-
-#[derive(Serialize)]
-struct SessionDescriptionContext {
-    ip_version: IpVersion,
-    target_ip: IpAddr,
-    target_port: u16,
-    fingerprint: String,
-}
+use crate::sdp;
 
 enum IfWatch {
     Pending(BoxFuture<'static, io::Result<IfWatcher>>),
@@ -300,11 +163,6 @@ impl WebRTCDirectTransport {
     }
 }
 
-// Create a [`Multiaddr`] from the given IP address and port number.
-fn ip_to_multiaddr(ip: IpAddr, port: u16) -> Multiaddr {
-    Multiaddr::empty().with(ip.into()).with(Protocol::Udp(port))
-}
-
 impl Transport for WebRTCDirectTransport {
     type Output = Connection;
     type Error = Error;
@@ -318,18 +176,10 @@ impl Transport for WebRTCDirectTransport {
             .ok_or_else(|| TransportError::MultiaddrNotSupported(addr))?;
         log::debug!("listening on {}", socket_addr);
 
-        // - [ ] when to create connection? upon receiving data?
-        //  set_remote_description spawns ICE
-        //  can't accept on UDP socket
-        //  when receiving data? but can be stupid data?
-        //  when ICE connection changes to established?
-        //  we spawn a new peer connection?
-
         Ok(Box::pin(self))
     }
 
     fn dial(self, addr: Multiaddr) -> Result<Self::Dial, TransportError<Self::Error>> {
-        log::debug!("dialing {}", addr);
         Ok(Box::pin(self.do_dial(addr)))
     }
 
@@ -378,6 +228,7 @@ impl Stream for WebRTCDirectTransport {
                                     if me.listen_addr.is_ipv4() == ip.is_ipv4()
                                         || me.listen_addr.is_ipv6() == ip.is_ipv6()
                                     {
+                                        // TODO: include fingerprint?
                                         let ma = ip_to_multiaddr(ip, me.listen_addr.port());
                                         log::debug!("New listen address: {}", ma);
                                         return Poll::Ready(Some(Ok(ListenerEvent::NewAddress(
@@ -390,6 +241,7 @@ impl Stream for WebRTCDirectTransport {
                                     if me.listen_addr.is_ipv4() == ip.is_ipv4()
                                         || me.listen_addr.is_ipv6() == ip.is_ipv6()
                                     {
+                                        // TODO: include fingerprint?
                                         let ma = ip_to_multiaddr(ip, me.listen_addr.port());
                                         log::debug!("Expired listen address: {}", ma);
                                         return Poll::Ready(Some(Ok(
@@ -419,6 +271,7 @@ impl Stream for WebRTCDirectTransport {
                     }
                 },
             }
+            // TODO: get new connection event from an endpoint? and establish new connection
         }
     }
 }
@@ -479,7 +332,7 @@ impl Stream for WebRTCDirectTransport {
 
 //     // Set the remote description to the predefined SDP
 //     let mut offer = peer_connection.create_offer(None).await?;
-//     offer.sdp = CLIENT_SESSION_DESCRIPTION.to_string();
+//     offer.sdp = sdp::CLIENT_SESSION_DESCRIPTION.to_string();
 //     debug!("REMOTE OFFER: {:?}", offer);
 //     peer_connection.set_remote_description(offer).await?;
 
@@ -496,6 +349,7 @@ impl Stream for WebRTCDirectTransport {
 
 impl WebRTCDirectTransport {
     async fn do_dial(self, addr: Multiaddr) -> Result<Connection, Error> {
+        log::debug!("dialing {}", addr);
         let mut inner_addr = addr.clone();
 
         let fingerprint = match inner_addr.pop() {
@@ -514,15 +368,15 @@ impl WebRTCDirectTransport {
 
         let server_session_description = {
             let mut tt = TinyTemplate::new();
-            tt.add_template("description", SERVER_SESSION_DESCRIPTION)
+            tt.add_template("description", sdp::SERVER_SESSION_DESCRIPTION)
                 .unwrap();
 
-            let context = SessionDescriptionContext {
+            let context = sdp::SessionDescriptionContext {
                 ip_version: {
                     if socket_addr.is_ipv4() {
-                        IpVersion::IP4
+                        sdp::IpVersion::IP4
                     } else {
-                        IpVersion::IP6
+                        sdp::IpVersion::IP6
                     }
                 },
                 target_ip: socket_addr.ip(),
@@ -625,6 +479,11 @@ impl WebRTCDirectTransport {
             connection: peer_connection,
         })
     }
+}
+
+// Create a [`Multiaddr`] from the given IP address and port number.
+fn ip_to_multiaddr(ip: IpAddr, port: u16) -> Multiaddr {
+    Multiaddr::empty().with(ip.into()).with(Protocol::Udp(port))
 }
 
 /// Tries to turn a WebRTC multiaddress into a [`SocketAddr`]. Returns None if the format of the
