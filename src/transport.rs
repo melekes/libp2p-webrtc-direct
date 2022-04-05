@@ -20,14 +20,12 @@
 
 use libp2p_core::{
     address_translation,
-    // connection::Endpoint,
     multiaddr::{Multiaddr, Protocol},
     transport::{ListenerEvent, TransportError},
     Transport,
 };
 
-// use bytes::Bytes;
-use futures::{future::BoxFuture, prelude::*, ready, stream::BoxStream};
+use futures::{future::BoxFuture, prelude::*, ready};
 use futures_timer::Delay;
 use if_watch::{IfEvent, IfWatcher};
 use log::{debug, error, trace};
@@ -72,10 +70,7 @@ enum IfWatch {
 /// The listening addresses of a [`WebRTCDirectTransport`].
 enum InAddr {
     /// The stream accepts connections on a single interface.
-    One {
-        addr: IpAddr,
-        out: Option<Multiaddr>,
-    },
+    One { out: Option<Multiaddr> },
     /// The stream accepts connections on all interfaces.
     Any { if_watch: IfWatch },
 }
@@ -183,7 +178,6 @@ impl WebRTCListenStream {
         } else {
             InAddr::One {
                 out: Some(ip_to_multiaddr(listen_addr.ip(), listen_addr.port())),
-                addr: listen_addr.ip(),
             }
         };
 
@@ -269,13 +263,24 @@ impl Stream for WebRTCListenStream {
                 },
                 // If the listener is bound to a single interface, make sure the
                 // address is registered for port reuse and reported once.
-                InAddr::One { addr, out } => {
+                InAddr::One { out } => {
                     if let Some(multiaddr) = out.take() {
                         return Poll::Ready(Some(Ok(ListenerEvent::NewAddress(multiaddr))));
                     }
                 },
             }
-            // TODO: get new connection event from an endpoint? and establish new connection
+
+            if let Some(mut pause) = me.pause.take() {
+                match Pin::new(&mut pause).poll(cx) {
+                    Poll::Ready(_) => {},
+                    Poll::Pending => {
+                        me.pause = Some(pause);
+                        return Poll::Pending;
+                    },
+                }
+            }
+
+            // TODO: poll for new connections the endpoint and call upgrade() if any
         }
     }
 }
