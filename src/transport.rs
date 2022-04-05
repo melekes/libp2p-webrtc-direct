@@ -19,17 +19,17 @@
 // DEALINGS IN THE SOFTWARE.
 
 use libp2p_core::{
-    connection::Endpoint,
+    address_translation,
+    // connection::Endpoint,
     multiaddr::{Multiaddr, Protocol},
     transport::{ListenerEvent, TransportError},
     Transport,
 };
 
-use async_std::net::IpAddr;
-use async_std::net::SocketAddr;
-use async_std::sync::Arc;
-use bytes::Bytes;
-use futures::{future::BoxFuture, prelude::*, stream::BoxStream};
+// use bytes::Bytes;
+use futures::{future::BoxFuture, prelude::*, ready, stream::BoxStream};
+use futures_timer::Delay;
+use if_watch::{IfEvent, IfWatcher};
 use log::{debug, error, trace};
 use serde::Serialize;
 use tinytemplate::TinyTemplate;
@@ -42,11 +42,25 @@ use webrtc::peer_connection::certificate::RTCCertificate;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::RTCPeerConnection;
-use webrtc_ice::udp_network::EphemeralUDP;
+use webrtc_ice::udp_mux::UDPMux;
+use webrtc_ice::udp_mux::UDPMuxDefault;
+use webrtc_ice::udp_mux::UDPMuxParams;
 use webrtc_ice::udp_network::UDPNetwork;
 
+#[cfg(feature = "tokio")]
+use tokio_crate::net::{ToSocketAddrs, UdpSocket};
+
+#[cfg(feature = "async-std")]
+use async_std_crate::net::{ToSocketAddrs, UdpSocket};
+
 use std::borrow::Cow;
-use std::marker::PhantomData;
+use std::io;
+use std::net::IpAddr;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use crate::error::Error;
 
@@ -159,7 +173,7 @@ o=- 0 0 IN IP {IP_VERSION} {TARGET_IP}
 s=-
 t=0 0
 a=ice-lite
-m=application {TARGET_PORT} {PROTOCOL}/DTLS/SCTP webrtc-datachannel
+m=application {TARGET_PORT} UDP/DTLS/SCTP webrtc-datachannel
 c=IN IP {IP_VERSION} {TARGET_IP}
 a=mid:0
 a=ice-options:ice2
@@ -170,7 +184,7 @@ a=fingerprint:sha-256 {FINGERPRINT}
 a=setup:passive
 a=sctp-port:5000
 a=max-message-size:100000
-a=candidate:1 1 {PROTOCOL} 2113667327 {TARGET_IP} {TARGET_PORT} typ host
+a=candidate:1 1 UDP 2113667327 {TARGET_IP} {TARGET_PORT} typ host
 ";
 
 #[derive(Serialize)]
@@ -179,373 +193,443 @@ enum IpVersion {
     IP6,
 }
 
-#[derive(Debug, Serialize, PartialEq)]
-pub enum TransportProtocol {
-    TCP,
-    UDP,
-}
-
 #[derive(Serialize)]
-struct Context {
+struct SessionDescriptionContext {
     ip_version: IpVersion,
     target_ip: IpAddr,
     target_port: u16,
-    protocol: TransportProtocol,
     fingerprint: String,
 }
 
+enum IfWatch {
+    Pending(BoxFuture<'static, io::Result<IfWatcher>>),
+    Ready(IfWatcher),
+}
+
+/// The listening addresses of a [`WebRTCDirectTransport`].
+enum InAddr {
+    /// The stream accepts connections on a single interface.
+    One {
+        addr: IpAddr,
+        out: Option<Multiaddr>,
+    },
+    /// The stream accepts connections on all interfaces.
+    Any { if_watch: IfWatch },
+}
+
 // A WebRTC connection.
-pub struct Connection<T> {
+pub struct Connection {
     connection: RTCPeerConnection,
     // receiver: BoxStream<'static, Result<Incoming, connection::Error>>,
     // sender: Pin<Box<dyn Sink<Outgoing, Error = connection::Error> + Send>>,
-    _marker: std::marker::PhantomData<T>,
 }
 
-/// A WebRTC transport based on either TCP or UDP transport.
-pub struct WebRTCDirectTransport<T> {
-    pub config: RTCConfiguration,
+/// A WebRTC direct transport <https://webrtc.rs/> webrtc-rs library.
+pub struct WebRTCDirectTransport {
+    config: RTCConfiguration,
+    udp_mux: Arc<dyn UDPMux + Send + Sync>,
 
-    transport: T,
-}
-
-impl<T> WebRTCDirectTransport<T> {
-    /// Create a new transport based on the inner transport.
+    /// The socket address that the listening socket is bound to,
+    /// which may be a "wildcard address" like `INADDR_ANY` or `IN6ADDR_ANY`
+    /// when listening on all interfaces for IPv4 respectively IPv6 connections.
+    listen_addr: SocketAddr,
+    /// The IP addresses of network interfaces on which the listening socket
+    /// is accepting connections.
     ///
-    /// See [`libp2p-tcp`](https://docs.rs/libp2p-tcp/) for constructing the inner transport.
-    pub fn new(transport: T, certificate: RTCCertificate) -> Self {
+    /// If the listen socket listens on all interfaces, these may change over
+    /// time as interfaces become available or unavailable.
+    in_addr: InAddr,
+    /// How long to sleep after a (non-fatal) error while trying
+    /// to accept a new connection.
+    sleep_on_error: Duration,
+    /// The current pause, if any.
+    pause: Option<Delay>,
+}
+
+impl WebRTCDirectTransport {
+    /// Create a new WebRTC transport.
+    ///
+    /// Creates a UDP socket bound to `addr`.
+    pub async fn new<A: ToSocketAddrs>(
+        certificate: RTCCertificate,
+        addr: A,
+    ) -> Result<Self, TransportError<Error>> {
+        // Create a webrtc config with the given certificate, which will be used for all DTLS
+        // handshakes.
         let config = RTCConfiguration {
             certificates: vec![certificate],
             ..Default::default()
         };
 
-        Self { transport, config }
+        // Create a UDP mux, which will be used across all connections.
+        let socket = UdpSocket::bind(addr)
+            .map_err(Error::IoError)
+            .map_err(TransportError::Other)
+            .await?;
+        let local_addr = socket
+            .local_addr()
+            .map_err(Error::IoError)
+            .map_err(TransportError::Other)?;
+        let udp_mux = UDPMuxDefault::new(UDPMuxParams::new(socket));
+
+        // Check whether the listening IP is set or not.
+        let in_addr = if match &local_addr {
+            SocketAddr::V4(a) => a.ip().is_unspecified(),
+            SocketAddr::V6(a) => a.ip().is_unspecified(),
+        } {
+            // The `addrs` are populated via `if_watch` when the
+            // `WebRTCDirectTransport` is polled.
+            InAddr::Any {
+                if_watch: IfWatch::Pending(IfWatcher::new().boxed()),
+            }
+        } else {
+            InAddr::One {
+                out: Some(ip_to_multiaddr(local_addr.ip(), local_addr.port())),
+                addr: local_addr.ip(),
+            }
+        };
+
+        Ok(Self {
+            config,
+            udp_mux,
+            listen_addr: local_addr,
+            in_addr,
+            pause: None,
+            sleep_on_error: Duration::from_millis(100),
+        })
     }
 }
 
-impl<T> Transport for WebRTCDirectTransport<T>
-where
-    T: Transport + Send + Clone + 'static,
-    T::Error: Send + 'static,
-    T::Dial: Send + 'static,
-    T::Listener: Send + 'static,
-    T::ListenerUpgrade: Send + 'static,
-    T::Output: Stream + Sink<Bytes> + Unpin + Send + 'static,
-{
-    type Output = Connection<T::Output>;
-    type Error = Error<T::Error>;
+// Create a [`Multiaddr`] from the given IP address and port number.
+fn ip_to_multiaddr(ip: IpAddr, port: u16) -> Multiaddr {
+    Multiaddr::empty().with(ip.into()).with(Protocol::Udp(port))
+}
+
+impl Transport for WebRTCDirectTransport {
+    type Output = Connection;
+    type Error = Error;
     type Listener =
         BoxStream<'static, Result<ListenerEvent<Self::ListenerUpgrade, Self::Error>, Self::Error>>;
     type ListenerUpgrade = BoxFuture<'static, Result<Self::Output, Self::Error>>;
     type Dial = BoxFuture<'static, Result<Self::Output, Self::Error>>;
 
     fn listen_on(self, addr: Multiaddr) -> Result<Self::Listener, TransportError<Self::Error>> {
-        let mut inner_addr = addr.clone();
-
-        let proto = match inner_addr.pop() {
-            Some(p @ Protocol::XWebRTC(_)) => p,
-            _ => {
-                debug!("{} is not a WebRTC multiaddr", addr);
-                return Err(TransportError::MultiaddrNotSupported(addr));
-            },
-        };
-
-        let (socket_addr, _) = multiaddr_to_socketaddr(&inner_addr)
+        let socket_addr = multiaddr_to_socketaddr(&addr)
             .ok_or_else(|| TransportError::MultiaddrNotSupported(addr))?;
+        log::debug!("listening on {}", socket_addr);
 
-        let transport = self
-            .transport
-            .listen_on(inner_addr)
-            .map_err(|e| e.map(Error::Transport))?;
+        // - [ ] when to create connection? upon receiving data?
+        //  set_remote_description spawns ICE
+        //  can't accept on UDP socket
+        //  when receiving data? but can be stupid data?
+        //  when ICE connection changes to established?
+        //  we spawn a new peer connection?
 
-        let listen = transport
-            .map_err(Error::Transport)
-            .map_ok(move |event| match event {
-                ListenerEvent::NewAddress(mut a) => {
-                    a = a.with(proto.clone());
-                    debug!("Listening on {}", a);
-                    ListenerEvent::NewAddress(a)
-                },
-                ListenerEvent::AddressExpired(mut a) => {
-                    a = a.with(proto.clone());
-                    ListenerEvent::AddressExpired(a)
-                },
-                ListenerEvent::Error(err) => ListenerEvent::Error(Error::Transport(err)),
-                ListenerEvent::Upgrade {
-                    upgrade,
-                    mut local_addr,
-                    mut remote_addr,
-                } => {
-                    local_addr = local_addr.with(proto.clone());
-                    remote_addr = remote_addr.with(proto.clone());
-                    let remote = remote_addr.clone(); // used for logging
-                    let config = self.config.clone();
-
-                    let upgrade = async move {
-                        let _stream = upgrade.map_err(Error::Transport).await?;
-                        trace!("Incoming connection from {}", remote);
-
-                        let mut se = build_settings(&socket_addr)?;
-
-                        // Act as a DTLS server (wait for ClientHello message from the remote).
-                        se.set_answering_dtls_role(DTLSRole::Server)?;
-
-                        let api = APIBuilder::new().with_setting_engine(se).build();
-
-                        let peer_connection = api.new_peer_connection(config).await?;
-
-                        peer_connection
-                            .on_peer_connection_state_change(Box::new(
-                                move |s: RTCPeerConnectionState| {
-                                    if s != RTCPeerConnectionState::Failed {
-                                        debug!("Peer Connection State has changed: {}", s);
-                                    } else {
-                                        // Wait until PeerConnection has had no network activity for 30 seconds or another
-                                        // failure. It may be reconnected using an ICE Restart. Use
-                                        // webrtc.PeerConnectionStateDisconnected if you are interested in detecting faster
-                                        // timeout. Note that the PeerConnection may come back from
-                                        // PeerConnectionStateDisconnected.
-                                        error!("Peer Connection has gone to failed => exiting");
-                                        // TODO: stop listening?
-                                    }
-
-                                    Box::pin(async {})
-                                },
-                            ))
-                            .await;
-
-                        peer_connection
-                            .on_data_channel(Box::new(move |d: Arc<RTCDataChannel>| {
-                                let d_label = d.label().to_owned();
-                                let d_id = d.id();
-                                debug!("New DataChannel {} {}", d_label, d_id);
-
-                                // Register channel opening handling
-                                Box::pin(async move {
-                                    // let d2 = Arc::clone(&d);
-                                    let d_label2 = d_label.clone();
-                                    let d_id2 = d_id;
-                                    d.on_open(Box::new(move || {
-                                        debug!("Data channel '{}'-'{}' open", d_label2, d_id2);
-                                        Box::pin(async {})
-                                    }))
-                                    .await;
-
-                                    // Register text message handling
-                                    d.on_message(Box::new(move |msg: DataChannelMessage| {
-                                        let msg_str = String::from_utf8(msg.data.to_vec()).unwrap();
-                                        debug!(
-                                            "Message from DataChannel '{}': '{}'",
-                                            d_label, msg_str
-                                        );
-                                        Box::pin(async {})
-                                    }))
-                                    .await;
-                                })
-                            }))
-                            .await;
-
-                        // Set the remote description to the predefined SDP
-                        let mut offer = peer_connection.create_offer(None).await?;
-                        offer.sdp = CLIENT_SESSION_DESCRIPTION.to_string();
-                        debug!("REMOTE OFFER: {:?}", offer);
-                        peer_connection.set_remote_description(offer).await?;
-
-                        let answer = peer_connection.create_answer(None).await?;
-                        // Set the local description and start UDP listeners
-                        // Note: this will start the gathering of ICE candidates
-                        debug!("LOCAL ANSWER: {:?}", answer);
-                        peer_connection.set_local_description(answer).await?;
-
-                        Ok(Connection {
-                            connection: peer_connection,
-                            _marker: PhantomData,
-                        })
-                    };
-
-                    ListenerEvent::Upgrade {
-                        upgrade: Box::pin(upgrade) as BoxFuture<'static, _>,
-                        local_addr,
-                        remote_addr,
-                    }
-                },
-            });
-        Ok(Box::pin(listen))
+        Ok(Box::pin(self))
     }
 
     fn dial(self, addr: Multiaddr) -> Result<Self::Dial, TransportError<Self::Error>> {
-        self.do_dial(addr, Endpoint::Dialer)
+        log::debug!("dialing {}", addr);
+        Ok(Box::pin(self.do_dial(addr)))
     }
 
     fn dial_as_listener(self, addr: Multiaddr) -> Result<Self::Dial, TransportError<Self::Error>> {
-        self.do_dial(addr, Endpoint::Listener)
+        self.dial(addr)
     }
 
     fn address_translation(&self, server: &Multiaddr, observed: &Multiaddr) -> Option<Multiaddr> {
-        self.transport.address_translation(server, observed)
+        address_translation(server, observed)
     }
 }
 
-impl<T> WebRTCDirectTransport<T>
-where
-    T: Transport + Send + Clone + 'static,
-    T::Error: Send + 'static,
-    T::Dial: Send + 'static,
-    T::Listener: Send + 'static,
-    T::ListenerUpgrade: Send + 'static,
-    T::Output: Stream + Sink<Bytes> + Unpin + Send + 'static,
-{
-    fn do_dial(
-        self,
-        addr: Multiaddr,
-        role_override: Endpoint,
-    ) -> Result<<Self as Transport>::Dial, TransportError<<Self as Transport>::Error>> {
+impl Stream for WebRTCDirectTransport {
+    type Item = Result<ListenerEvent<BoxFuture<'static, Result<Connection, Error>>, Error>, Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        let me = Pin::into_inner(self);
+
+        loop {
+            match &mut me.in_addr {
+                InAddr::Any { if_watch } => match if_watch {
+                    // If we listen on all interfaces, wait for `if-watch` to be ready.
+                    IfWatch::Pending(f) => match ready!(Pin::new(f).poll(cx)) {
+                        Ok(w) => {
+                            *if_watch = IfWatch::Ready(w);
+                            continue;
+                        },
+                        Err(err) => {
+                            log::debug! {
+                                "Failed to begin observing interfaces: {:?}. Scheduling retry.",
+                                err
+                            };
+                            *if_watch = IfWatch::Pending(IfWatcher::new().boxed());
+                            me.pause = Some(Delay::new(me.sleep_on_error));
+                            return Poll::Ready(Some(Ok(ListenerEvent::Error(Error::IoError(
+                                err,
+                            )))));
+                        },
+                    },
+                    // Consume all events for up/down interface changes.
+                    IfWatch::Ready(watch) => {
+                        while let Poll::Ready(ev) = watch.poll_unpin(cx) {
+                            match ev {
+                                Ok(IfEvent::Up(inet)) => {
+                                    let ip = inet.addr();
+                                    if me.listen_addr.is_ipv4() == ip.is_ipv4()
+                                        || me.listen_addr.is_ipv6() == ip.is_ipv6()
+                                    {
+                                        let ma = ip_to_multiaddr(ip, me.listen_addr.port());
+                                        log::debug!("New listen address: {}", ma);
+                                        return Poll::Ready(Some(Ok(ListenerEvent::NewAddress(
+                                            ma,
+                                        ))));
+                                    }
+                                },
+                                Ok(IfEvent::Down(inet)) => {
+                                    let ip = inet.addr();
+                                    if me.listen_addr.is_ipv4() == ip.is_ipv4()
+                                        || me.listen_addr.is_ipv6() == ip.is_ipv6()
+                                    {
+                                        let ma = ip_to_multiaddr(ip, me.listen_addr.port());
+                                        log::debug!("Expired listen address: {}", ma);
+                                        return Poll::Ready(Some(Ok(
+                                            ListenerEvent::AddressExpired(ma),
+                                        )));
+                                    }
+                                },
+                                Err(err) => {
+                                    log::debug! {
+                                        "Failure polling interfaces: {:?}. Scheduling retry.",
+                                        err
+                                    };
+                                    me.pause = Some(Delay::new(me.sleep_on_error));
+                                    return Poll::Ready(Some(Ok(ListenerEvent::Error(
+                                        Error::IoError(err),
+                                    ))));
+                                },
+                            }
+                        }
+                    },
+                },
+                // If the listener is bound to a single interface, make sure the
+                // address is registered for port reuse and reported once.
+                InAddr::One { addr, out } => {
+                    if let Some(multiaddr) = out.take() {
+                        return Poll::Ready(Some(Ok(ListenerEvent::NewAddress(multiaddr))));
+                    }
+                },
+            }
+        }
+    }
+}
+
+// async fn upgrade() {
+//     let mut se = build_settings(self.udp_mux.clone());
+//     // Act as a DTLS server (one which waits for a connection).
+//     se.set_answering_dtls_role(DTLSRole::Server)?;
+
+//     let api = APIBuilder::new().with_setting_engine(se).build();
+//     let peer_connection = api.new_peer_connection(config).await?;
+
+//     peer_connection
+//         .on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
+//             if s != RTCPeerConnectionState::Failed {
+//                 debug!("Peer Connection State has changed: {}", s);
+//             } else {
+//                 // Wait until PeerConnection has had no network activity for 30 seconds or another
+//                 // failure. It may be reconnected using an ICE Restart. Use
+//                 // webrtc.PeerConnectionStateDisconnected if you are interested in detecting faster
+//                 // timeout. Note that the PeerConnection may come back from
+//                 // PeerConnectionStateDisconnected.
+//                 error!("Peer Connection has gone to failed => exiting");
+//                 // TODO: stop listening?
+//             }
+
+//             Box::pin(async {})
+//         }))
+//         .await;
+
+//     peer_connection
+//         .on_data_channel(Box::new(move |d: Arc<RTCDataChannel>| {
+//             let d_label = d.label().to_owned();
+//             let d_id = d.id();
+//             debug!("New DataChannel {} {}", d_label, d_id);
+
+//             // Register channel opening handling
+//             Box::pin(async move {
+//                 // let d2 = Arc::clone(&d);
+//                 let d_label2 = d_label.clone();
+//                 let d_id2 = d_id;
+//                 d.on_open(Box::new(move || {
+//                     debug!("Data channel '{}'-'{}' open", d_label2, d_id2);
+//                     Box::pin(async {})
+//                 }))
+//                 .await;
+
+//                 // Register text message handling
+//                 d.on_message(Box::new(move |msg: DataChannelMessage| {
+//                     let msg_str = String::from_utf8(msg.data.to_vec()).unwrap();
+//                     debug!("Message from DataChannel '{}': '{}'", d_label, msg_str);
+//                     Box::pin(async {})
+//                 }))
+//                 .await;
+//             })
+//         }))
+//         .await;
+
+//     // Set the remote description to the predefined SDP
+//     let mut offer = peer_connection.create_offer(None).await?;
+//     offer.sdp = CLIENT_SESSION_DESCRIPTION.to_string();
+//     debug!("REMOTE OFFER: {:?}", offer);
+//     peer_connection.set_remote_description(offer).await?;
+
+//     let answer = peer_connection.create_answer(None).await?;
+//     // Set the local description and start UDP listeners
+//     // Note: this will start the gathering of ICE candidates
+//     debug!("LOCAL ANSWER: {:?}", answer);
+//     peer_connection.set_local_description(answer).await?;
+
+//     Ok(Connection {
+//         connection: peer_connection,
+//     })
+// }
+
+impl WebRTCDirectTransport {
+    async fn do_dial(self, addr: Multiaddr) -> Result<Connection, Error> {
         let mut inner_addr = addr.clone();
 
         let fingerprint = match inner_addr.pop() {
             Some(Protocol::XWebRTC(f)) => f,
             _ => {
                 debug!("{} is not a WebRTC multiaddr", addr);
-                return Err(TransportError::MultiaddrNotSupported(addr));
+                return Err(Error::InvalidMultiaddr(addr));
             },
         };
 
-        let (socket_addr, transport_protocol) = multiaddr_to_socketaddr(&inner_addr)
-            .ok_or_else(|| TransportError::MultiaddrNotSupported(inner_addr))?;
+        let socket_addr = multiaddr_to_socketaddr(&inner_addr)
+            .ok_or_else(|| Error::InvalidMultiaddr(addr.clone()))?;
+        if socket_addr.port() == 0 || socket_addr.ip().is_unspecified() {
+            return Err(Error::InvalidMultiaddr(addr.clone()));
+        }
 
-        let mut tt = TinyTemplate::new();
-        tt.add_template("description", SERVER_SESSION_DESCRIPTION)
-            .unwrap();
+        let server_session_description = {
+            let mut tt = TinyTemplate::new();
+            tt.add_template("description", SERVER_SESSION_DESCRIPTION)
+                .unwrap();
 
-        let context = Context {
-            ip_version: {
-                if socket_addr.is_ipv4() {
-                    IpVersion::IP4
-                } else {
-                    IpVersion::IP6
-                }
-            },
-            target_ip: socket_addr.ip(),
-            target_port: socket_addr.port(),
-            protocol: transport_protocol,
-            fingerprint: hex::encode(fingerprint.as_ref()),
+            let context = SessionDescriptionContext {
+                ip_version: {
+                    if socket_addr.is_ipv4() {
+                        IpVersion::IP4
+                    } else {
+                        IpVersion::IP6
+                    }
+                },
+                target_ip: socket_addr.ip(),
+                target_port: socket_addr.port(),
+                fingerprint: hex::encode(fingerprint.as_ref()),
+            };
+            tt.render("description", &context).unwrap()
         };
-        let server_session_description = tt.render("description", &context).unwrap();
 
         let config = self.config.clone();
-        let future = async move {
-            let remote = addr.clone(); // used for logging
 
-            trace!("dialing address: {:?}", remote);
+        let remote = addr.clone(); // used for logging
 
-            let dial = match role_override {
-                Endpoint::Dialer => self.transport.dial(addr),
-                Endpoint::Listener => self.transport.dial_as_listener(addr),
-            }
-            .map_err(|e| match e {
-                TransportError::MultiaddrNotSupported(a) => Error::InvalidMultiaddr(a),
-                TransportError::Other(e) => Error::Transport(e),
-            })?;
+        trace!("dialing address: {:?}", remote);
 
-            let _stream = dial.map_err(Error::Transport).await?;
-            trace!("transport connection to {} established", remote);
+        let mut se = build_settings(self.udp_mux.clone());
 
-            let mut se = build_settings(&socket_addr)?;
+        // Act as a DTLS client (one which initiates a connection).
+        se.set_answering_dtls_role(DTLSRole::Client)
+            .map_err(Error::WebRTC)?;
 
-            // Act as a DTLS server (wait for ClientHello message from the remote).
-            se.set_answering_dtls_role(DTLSRole::Client)
-                .map_err(Error::WebRTC)?;
+        let api = APIBuilder::new().with_setting_engine(se).build();
 
-            let api = APIBuilder::new().with_setting_engine(se).build();
+        let peer_connection = api
+            .new_peer_connection(config)
+            .map_err(Error::WebRTC)
+            .await?;
 
-            let peer_connection = api
-                .new_peer_connection(config)
-                .map_err(Error::WebRTC)
-                .await?;
+        // TODO: dedup
+        peer_connection
+            .on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
+                if s != RTCPeerConnectionState::Failed {
+                    debug!("Peer Connection State has changed: {}", s);
+                } else {
+                    // Wait until PeerConnection has had no network activity for 30 seconds or another
+                    // failure. It may be reconnected using an ICE Restart. Use
+                    // webrtc.PeerConnectionStateDisconnected if you are interested in detecting faster
+                    // timeout. Note that the PeerConnection may come back from
+                    // PeerConnectionStateDisconnected.
+                    error!("Peer Connection has gone to failed => exiting");
+                    // TODO: stop listening?
+                }
 
-            // TODO: dedup
-            peer_connection
-                .on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
-                    if s != RTCPeerConnectionState::Failed {
-                        debug!("Peer Connection State has changed: {}", s);
-                    } else {
-                        // Wait until PeerConnection has had no network activity for 30 seconds or another
-                        // failure. It may be reconnected using an ICE Restart. Use
-                        // webrtc.PeerConnectionStateDisconnected if you are interested in detecting faster
-                        // timeout. Note that the PeerConnection may come back from
-                        // PeerConnectionStateDisconnected.
-                        error!("Peer Connection has gone to failed => exiting");
-                        // TODO: stop listening?
-                    }
+                Box::pin(async {})
+            }))
+            .await;
 
-                    Box::pin(async {})
-                }))
-                .await;
+        peer_connection
+            .on_data_channel(Box::new(move |d: Arc<RTCDataChannel>| {
+                let d_label = d.label().to_owned();
+                let d_id = d.id();
+                debug!("New DataChannel {} {}", d_label, d_id);
 
-            peer_connection
-                .on_data_channel(Box::new(move |d: Arc<RTCDataChannel>| {
-                    let d_label = d.label().to_owned();
-                    let d_id = d.id();
-                    debug!("New DataChannel {} {}", d_label, d_id);
+                // Register channel opening handling
+                Box::pin(async move {
+                    // let d2 = Arc::clone(&d);
+                    let d_label2 = d_label.clone();
+                    let d_id2 = d_id;
+                    d.on_open(Box::new(move || {
+                        debug!("Data channel '{}'-'{}' open", d_label2, d_id2);
+                        Box::pin(async {})
+                    }))
+                    .await;
 
-                    // Register channel opening handling
-                    Box::pin(async move {
-                        // let d2 = Arc::clone(&d);
-                        let d_label2 = d_label.clone();
-                        let d_id2 = d_id;
-                        d.on_open(Box::new(move || {
-                            debug!("Data channel '{}'-'{}' open", d_label2, d_id2);
-                            Box::pin(async {})
-                        }))
-                        .await;
+                    // Register text message handling
+                    d.on_message(Box::new(move |msg: DataChannelMessage| {
+                        let msg_str = String::from_utf8(msg.data.to_vec()).unwrap();
+                        debug!("Message from DataChannel '{}': '{}'", d_label, msg_str);
+                        Box::pin(async {})
+                    }))
+                    .await;
+                })
+            }))
+            .await;
 
-                        // Register text message handling
-                        d.on_message(Box::new(move |msg: DataChannelMessage| {
-                            let msg_str = String::from_utf8(msg.data.to_vec()).unwrap();
-                            debug!("Message from DataChannel '{}': '{}'", d_label, msg_str);
-                            Box::pin(async {})
-                        }))
-                        .await;
-                    })
-                }))
-                .await;
+        let offer = peer_connection
+            .create_offer(None)
+            .map_err(Error::WebRTC)
+            .await?;
+        debug!("LOCAL OFFER: {:?}", offer);
+        peer_connection
+            .set_local_description(offer)
+            .map_err(Error::WebRTC)
+            .await?;
 
-            let offer = peer_connection
-                .create_offer(None)
-                .map_err(Error::WebRTC)
-                .await?;
-            debug!("LOCAL OFFER: {:?}", offer);
-            peer_connection
-                .set_local_description(offer)
-                .map_err(Error::WebRTC)
-                .await?;
+        let mut answer = peer_connection
+            .create_answer(None)
+            .map_err(Error::WebRTC)
+            .await?;
+        // Set the local description and start UDP listeners
+        // Note: this will start the gathering of ICE candidates
+        answer.sdp = server_session_description;
+        debug!("REMOTE ANSWER: {:?}", answer);
+        peer_connection
+            .set_remote_description(answer)
+            .map_err(Error::WebRTC)
+            .await?;
 
-            let mut answer = peer_connection
-                .create_answer(None)
-                .map_err(Error::WebRTC)
-                .await?;
-            // Set the local description and start UDP listeners
-            // Note: this will start the gathering of ICE candidates
-            answer.sdp = server_session_description;
-            debug!("REMOTE ANSWER: {:?}", answer);
-            peer_connection
-                .set_remote_description(answer)
-                .map_err(Error::WebRTC)
-                .await?;
-
-            Ok(Connection {
-                connection: peer_connection,
-                _marker: PhantomData,
-            })
-        };
-
-        Ok(Box::pin(future))
+        Ok(Connection {
+            connection: peer_connection,
+        })
     }
 }
 
 /// Tries to turn a WebRTC multiaddress into a [`SocketAddr`]. Returns None if the format of the
 /// multiaddr is wrong.
-fn multiaddr_to_socketaddr(addr: &Multiaddr) -> Option<(SocketAddr, TransportProtocol)> {
+fn multiaddr_to_socketaddr(addr: &Multiaddr) -> Option<SocketAddr> {
     let mut iter = addr.iter();
     let proto1 = iter.next()?;
     let proto2 = iter.next()?;
@@ -560,16 +644,16 @@ fn multiaddr_to_socketaddr(addr: &Multiaddr) -> Option<(SocketAddr, TransportPro
 
     match (proto1, proto2, proto3) {
         (Protocol::Ip4(ip), Protocol::Udp(port), Protocol::XWebRTC(_)) => {
-            Some((SocketAddr::new(ip.into(), port), TransportProtocol::UDP))
+            Some(SocketAddr::new(ip.into(), port))
         },
         (Protocol::Ip6(ip), Protocol::Udp(port), Protocol::XWebRTC(_)) => {
-            Some((SocketAddr::new(ip.into(), port), TransportProtocol::UDP))
+            Some(SocketAddr::new(ip.into(), port))
         },
         (Protocol::Ip4(ip), Protocol::Tcp(port), Protocol::XWebRTC(_)) => {
-            Some((SocketAddr::new(ip.into(), port), TransportProtocol::TCP))
+            Some(SocketAddr::new(ip.into(), port))
         },
         (Protocol::Ip6(ip), Protocol::Tcp(port), Protocol::XWebRTC(_)) => {
-            Some((SocketAddr::new(ip.into(), port), TransportProtocol::TCP))
+            Some(SocketAddr::new(ip.into(), port))
         },
         _ => None,
     }
@@ -578,20 +662,15 @@ fn multiaddr_to_socketaddr(addr: &Multiaddr) -> Option<(SocketAddr, TransportPro
 /// Turns an IP address and port into the corresponding WebRTC multiaddr.
 pub(crate) fn socketaddr_to_multiaddr<'a>(
     socket_addr: &SocketAddr,
-    transport_protocol: TransportProtocol,
     fingerprint: Cow<'a, [u8; 32]>,
 ) -> Multiaddr {
-    let p = match transport_protocol {
-        TransportProtocol::UDP => Protocol::Udp(socket_addr.port()),
-        TransportProtocol::TCP => Protocol::Tcp(socket_addr.port()),
-    };
     Multiaddr::empty()
         .with(socket_addr.ip().into())
-        .with(p)
+        .with(Protocol::Udp(socket_addr.port()))
         .with(Protocol::XWebRTC(fingerprint))
 }
 
-fn build_settings<E>(socket_addr: &SocketAddr) -> Result<SettingEngine, Error<E>> {
+fn build_settings(udp_mux: Arc<dyn UDPMux + Send + Sync>) -> SettingEngine {
     let mut se = SettingEngine::default();
 
     // Disable remote's fingerprint verification.
@@ -604,18 +683,9 @@ fn build_settings<E>(socket_addr: &SocketAddr) -> Result<SettingEngine, Error<E>
     // It will be checked by remote side when exchanging ICE messages.
     se.set_ice_credentials("user".to_string(), "password".to_string());
 
-    // UDP network ([`UDPNetwork`]) is used for ICE traffic.
-    // Only one UDP port is needed because there's going to be just one
-    // candidate. Hence `port_min` == `port_max`.
-    //
-    // In case of TCP transport, there will be two open ports (same number; one
-    // for TCP and one for UDP).
-    se.set_udp_network(UDPNetwork::Ephemeral(
-        EphemeralUDP::new(socket_addr.port(), socket_addr.port())
-            .map_err(|e| Error::WebRTC(webrtc::Error::Ice(e)))?,
-    ));
+    se.set_udp_network(UDPNetwork::Muxed(udp_mux));
 
-    Ok(se)
+    se
 }
 
 // Tests //////////////////////////////////////////////////////////////////////////////////////////
@@ -642,7 +712,7 @@ mod tests {
             Some(( SocketAddr::new(
                         IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
                         12345,
-            ), TransportProtocol::TCP ))
+            ) ))
         );
 
         assert_eq!(
@@ -654,7 +724,7 @@ mod tests {
             Some(( SocketAddr::new(
                         IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
                         12345,
-            ), TransportProtocol::TCP ))
+            ) ))
         );
 
         assert!(multiaddr_to_socketaddr(
@@ -673,7 +743,7 @@ mod tests {
             Some(( SocketAddr::new(
                         IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)),
                         8080,
-            ), TransportProtocol::UDP ))
+            ) ))
         );
         assert_eq!(
             multiaddr_to_socketaddr(
@@ -684,7 +754,7 @@ mod tests {
             Some(( SocketAddr::new(
                         IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)),
                         12345,
-            ), TransportProtocol::UDP ))
+            ) ))
         );
         assert_eq!(
             multiaddr_to_socketaddr(
@@ -697,7 +767,7 @@ mod tests {
                                 65535, 65535, 65535, 65535, 65535, 65535, 65535, 65535,
                         )),
                         8080,
-            ), TransportProtocol::TCP ))
+            ) ))
         );
     }
 
@@ -712,7 +782,6 @@ mod tests {
         assert_eq!(
             socketaddr_to_multiaddr(
                 &SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345,),
-                TransportProtocol::TCP,
                 hex_to_cow("ACD1E533EC271FCDE0275947F4D62A2B2331FF10C9DDE0298EB7B399B4BFF60B"),
             ),
             "/ip4/127.0.0.1/tcp/12345/x-webrtc/ACD1E533EC271FCDE0275947F4D62A2B2331FF10C9DDE0298EB7B399B4BFF60B"
