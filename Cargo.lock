@@ -1372,6 +1372,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-std",
+ "async-trait",
  "bytes",
  "chrono",
  "clap",
@@ -1391,6 +1392,7 @@ dependencies = [
  "rustls-pemfile",
  "rw-stream-sink",
  "serde",
+ "stun",
  "thiserror",
  "tinytemplate",
  "tokio",
@@ -1399,6 +1401,7 @@ dependencies = [
  "webrtc",
  "webrtc-dtls",
  "webrtc-ice",
+ "webrtc-util",
 ]
 
 [[package]]

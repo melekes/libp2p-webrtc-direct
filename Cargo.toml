@@ -39,6 +39,9 @@ webrtc-dtls = "0.5.2"
 webrtc-ice = "0.6.6"
 if-watch = "0.2.2"
 futures-timer = "3.0"
+stun = "0.4.2"
+webrtc-util = { version = "0.5.3", default-features = false, features = ["conn", "vnet", "sync"] }
+async-trait = "0.1.52"
 
 [features]
 default = ["tokio"]
