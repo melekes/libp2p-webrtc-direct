@@ -20,17 +20,9 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-// TODO:
-//  - bind to the same socket? not possible
-//  - UDPMux#get_conn
-//  - ufrag must be unique? shit. okay, let's derive from fingerprint
-//  - get_conn, get_original_conn? no, we need to basically reimplement webrtc_util
-//  - read data from original socket, parse ip and check if it's known
-//     -- if it's known, proxy it? how? exactly how webrtc_util does it
-//     -- if it's not known, upgrade
-
 use std::{collections::HashMap, io::ErrorKind, net::SocketAddr, sync::Arc};
 
+use futures::channel::mpsc;
 use webrtc_ice::udp_mux::UDPMux;
 use webrtc_util::{sync::RwLock, Conn, Error};
 
@@ -86,7 +78,7 @@ impl UDPMuxParams {
     }
 }
 
-pub struct UDPMuxDefault {
+pub struct UDPMuxNewAddr {
     /// The params this instance is configured with.
     /// Contains the underlying UDP socket in use
     params: UDPMuxParams,
@@ -104,8 +96,8 @@ pub struct UDPMuxDefault {
     closed_watch_rx: watch::Receiver<()>,
 }
 
-impl UDPMuxDefault {
-    pub fn new(params: UDPMuxParams) -> Arc<Self> {
+impl UDPMuxNewAddr {
+    pub fn new(params: UDPMuxParams, mut new_addr_tx: mpsc::Sender<SocketAddr>) -> Arc<Self> {
         let (closed_watch_tx, closed_watch_rx) = watch::channel(());
 
         let mux = Arc::new(Self {
@@ -117,7 +109,7 @@ impl UDPMuxDefault {
         });
 
         let cloned_mux = Arc::clone(&mux);
-        cloned_mux.start_conn_worker(closed_watch_rx);
+        cloned_mux.start_conn_worker(closed_watch_rx, new_addr_tx);
 
         mux
     }
@@ -214,7 +206,11 @@ impl UDPMuxDefault {
         }
     }
 
-    fn start_conn_worker(self: Arc<Self>, mut closed_watch_rx: watch::Receiver<()>) {
+    fn start_conn_worker(
+        self: Arc<Self>,
+        mut closed_watch_rx: watch::Receiver<()>,
+        mut new_addr_tx: mpsc::Sender<SocketAddr>,
+    ) {
         tokio::spawn(async move {
             let mut buffer = [0u8; RECEIVE_MTU];
 
@@ -247,7 +243,10 @@ impl UDPMuxDefault {
 
                                 match conn {
                                     None => {
-                                        log::trace!("Dropping packet from {}", &addr);
+                                        log::trace!("Notifying about new address {}", &addr);
+                                        if let Err(err) = new_addr_tx.try_send(addr) {
+                                            log::error!("Failed to send new address {}: {}", &addr, err);
+                                        }
                                     }
                                     Some(conn) => {
                                         if let Err(err) = conn.write_packet(&buffer[..len], addr).await {
@@ -273,7 +272,7 @@ impl UDPMuxDefault {
 }
 
 #[async_trait]
-impl UDPMux for UDPMuxDefault {
+impl UDPMux for UDPMuxNewAddr {
     async fn close(&self) -> Result<(), Error> {
         if self.is_closed().await {
             return Err(Error::ErrAlreadyClosed);

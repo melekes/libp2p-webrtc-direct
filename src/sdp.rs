@@ -95,7 +95,7 @@ use std::net::IpAddr;
 /// a=max-message-size:<value>
 ///
 ///     The maximum SCTP user message size (in bytes). (RFC8841)
-const CLIENT_SESSION_DESCRIPTION: &'static str = "v=0
+pub const CLIENT_SESSION_DESCRIPTION: &'static str = "v=0
 o=- 0 0 IN IP4 0.0.0.0
 s=-
 c=IN IP4 0.0.0.0

@@ -30,7 +30,7 @@ use tokio_crate::sync::watch;
 use webrtc_util::{sync::Mutex, Buffer, Conn, Error};
 
 use super::socket_addr_ext::{SocketAddrExt, MAX_ADDR_SIZE};
-use super::{normalize_socket_addr, UDPMuxDefault, RECEIVE_MTU};
+use super::{normalize_socket_addr, UDPMuxNewAddr, RECEIVE_MTU};
 
 #[inline(always)]
 /// Create a buffer of appropriate size to fit both a packet with max RECEIVE_MTU and the
@@ -47,9 +47,9 @@ pub(crate) struct UDPMuxConnParams {
     pub(super) key: String,
 
     // NOTE: This Arc exists in both directions which is liable to cause a retain cycle. This is
-    // accounted for in [`UDPMuxDefault::close`], which makes sure to drop all Arcs referencing any
+    // accounted for in [`UDPMuxNewAddr::close`], which makes sure to drop all Arcs referencing any
     // `UDPMuxConn`.
-    pub(super) udp_mux: Arc<UDPMuxDefault>,
+    pub(super) udp_mux: Arc<UDPMuxNewAddr>,
 }
 
 struct UDPMuxConnInner {

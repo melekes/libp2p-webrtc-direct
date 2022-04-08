@@ -25,7 +25,7 @@ use libp2p_core::{
     Transport,
 };
 
-use futures::{future::BoxFuture, prelude::*, ready};
+use futures::{channel::mpsc, future::BoxFuture, prelude::*, ready};
 use futures_timer::Delay;
 use if_watch::{IfEvent, IfWatcher};
 use log::{debug, error, trace};
@@ -40,8 +40,6 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc_ice::udp_mux::UDPMux;
-use webrtc_ice::udp_mux::UDPMuxDefault;
-use webrtc_ice::udp_mux::UDPMuxParams;
 use webrtc_ice::udp_network::UDPNetwork;
 
 #[cfg(feature = "tokio")]
@@ -62,6 +60,10 @@ use std::time::Duration;
 use crate::error::Error;
 use crate::sdp;
 
+use crate::udp_mux::UDPMuxNewAddr;
+use crate::udp_mux::UDPMuxParams;
+use crate::upgrade::WebRTCUpgrade;
+
 enum IfWatch {
     Pending(BoxFuture<'static, io::Result<IfWatcher>>),
     Ready(IfWatcher),
@@ -77,7 +79,7 @@ enum InAddr {
 
 // A WebRTC connection.
 pub struct Connection {
-    connection: RTCPeerConnection,
+    pub connection: RTCPeerConnection,
     // receiver: BoxStream<'static, Result<Incoming, connection::Error>>,
     // sender: Pin<Box<dyn Sink<Outgoing, Error = connection::Error> + Send>>,
 }
@@ -86,6 +88,7 @@ pub struct Connection {
 pub struct WebRTCDirectTransport {
     config: RTCConfiguration,
     udp_mux: Arc<dyn UDPMux + Send + Sync>,
+    new_addr_rx: mpsc::Receiver<SocketAddr>,
 }
 
 impl WebRTCDirectTransport {
@@ -108,9 +111,14 @@ impl WebRTCDirectTransport {
             .map_err(Error::IoError)
             .map_err(TransportError::Other)
             .await?;
-        let udp_mux = UDPMuxDefault::new(UDPMuxParams::new(socket));
+        let (new_addr_tx, new_addr_rx) = mpsc::channel(1);
+        let udp_mux = UDPMuxNewAddr::new(UDPMuxParams::new(socket), new_addr_tx);
 
-        Ok(Self { config, udp_mux })
+        Ok(Self {
+            config,
+            udp_mux,
+            new_addr_rx,
+        })
     }
 }
 
@@ -126,7 +134,12 @@ impl Transport for WebRTCDirectTransport {
             .ok_or_else(|| TransportError::MultiaddrNotSupported(addr))?;
         log::debug!("listening on {}", socket_addr);
 
-        Ok(WebRTCListenStream::new(socket_addr))
+        Ok(WebRTCListenStream::new(
+            socket_addr,
+            self.config.clone(),
+            self.udp_mux.clone(),
+            self.new_addr_rx,
+        ))
     }
 
     fn dial(self, addr: Multiaddr) -> Result<Self::Dial, TransportError<Self::Error>> {
@@ -159,12 +172,22 @@ pub struct WebRTCListenStream {
     sleep_on_error: Duration,
     /// The current pause, if any.
     pause: Option<Delay>,
+
+    // TODO: why copy from WebRTCDirectTransport
+    config: RTCConfiguration,
+    udp_mux: Arc<dyn UDPMux + Send + Sync>,
+    new_addr_rx: mpsc::Receiver<SocketAddr>,
 }
 
 impl WebRTCListenStream {
     /// Constructs a `WebRTCListenStream` for incoming connections around
     /// the given `TcpListener`.
-    fn new(listen_addr: SocketAddr) -> Self {
+    fn new(
+        listen_addr: SocketAddr,
+        config: RTCConfiguration,
+        udp_mux: Arc<dyn UDPMux + Send + Sync>,
+        new_addr_rx: mpsc::Receiver<SocketAddr>,
+    ) -> Self {
         // Check whether the listening IP is set or not.
         let in_addr = if match &listen_addr {
             SocketAddr::V4(a) => a.ip().is_unspecified(),
@@ -186,6 +209,9 @@ impl WebRTCListenStream {
             in_addr,
             pause: None,
             sleep_on_error: Duration::from_millis(100),
+            config,
+            udp_mux,
+            new_addr_rx,
         }
     }
 }
@@ -280,81 +306,22 @@ impl Stream for WebRTCListenStream {
                 }
             }
 
-            // TODO: poll for new connections the endpoint and call upgrade() if any
+            return match Pin::new(&mut me.new_addr_rx).poll_next(cx) {
+                Poll::Ready(Some(socket_addr)) => Poll::Ready(Some(Ok(ListenerEvent::Upgrade {
+                    local_addr: ip_to_multiaddr(me.listen_addr.ip(), me.listen_addr.port()),
+                    remote_addr: ip_to_multiaddr(socket_addr.ip(), socket_addr.port()),
+                    upgrade: Box::pin(WebRTCUpgrade::new(
+                        me.udp_mux.clone(),
+                        me.config.clone(),
+                        socket_addr,
+                    )) as BoxFuture<'static, _>,
+                }))),
+                Poll::Ready(None) => Poll::Ready(None),
+                Poll::Pending => Poll::Pending,
+            };
         }
     }
 }
-
-// async fn upgrade() {
-//     let mut se = build_settings(self.udp_mux.clone());
-//     // Act as a DTLS server (one which waits for a connection).
-//     se.set_answering_dtls_role(DTLSRole::Server)?;
-
-//     let api = APIBuilder::new().with_setting_engine(se).build();
-//     let peer_connection = api.new_peer_connection(config).await?;
-
-//     peer_connection
-//         .on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
-//             if s != RTCPeerConnectionState::Failed {
-//                 debug!("Peer Connection State has changed: {}", s);
-//             } else {
-//                 // Wait until PeerConnection has had no network activity for 30 seconds or another
-//                 // failure. It may be reconnected using an ICE Restart. Use
-//                 // webrtc.PeerConnectionStateDisconnected if you are interested in detecting faster
-//                 // timeout. Note that the PeerConnection may come back from
-//                 // PeerConnectionStateDisconnected.
-//                 error!("Peer Connection has gone to failed => exiting");
-//                 // TODO: stop listening?
-//             }
-
-//             Box::pin(async {})
-//         }))
-//         .await;
-
-//     peer_connection
-//         .on_data_channel(Box::new(move |d: Arc<RTCDataChannel>| {
-//             let d_label = d.label().to_owned();
-//             let d_id = d.id();
-//             debug!("New DataChannel {} {}", d_label, d_id);
-
-//             // Register channel opening handling
-//             Box::pin(async move {
-//                 // let d2 = Arc::clone(&d);
-//                 let d_label2 = d_label.clone();
-//                 let d_id2 = d_id;
-//                 d.on_open(Box::new(move || {
-//                     debug!("Data channel '{}'-'{}' open", d_label2, d_id2);
-//                     Box::pin(async {})
-//                 }))
-//                 .await;
-
-//                 // Register text message handling
-//                 d.on_message(Box::new(move |msg: DataChannelMessage| {
-//                     let msg_str = String::from_utf8(msg.data.to_vec()).unwrap();
-//                     debug!("Message from DataChannel '{}': '{}'", d_label, msg_str);
-//                     Box::pin(async {})
-//                 }))
-//                 .await;
-//             })
-//         }))
-//         .await;
-
-//     // Set the remote description to the predefined SDP
-//     let mut offer = peer_connection.create_offer(None).await?;
-//     offer.sdp = sdp::CLIENT_SESSION_DESCRIPTION.to_string();
-//     debug!("REMOTE OFFER: {:?}", offer);
-//     peer_connection.set_remote_description(offer).await?;
-
-//     let answer = peer_connection.create_answer(None).await?;
-//     // Set the local description and start UDP listeners
-//     // Note: this will start the gathering of ICE candidates
-//     debug!("LOCAL ANSWER: {:?}", answer);
-//     peer_connection.set_local_description(answer).await?;
-
-//     Ok(Connection {
-//         connection: peer_connection,
-//     })
-// }
 
 impl WebRTCDirectTransport {
     async fn do_dial(self, addr: Multiaddr) -> Result<Connection, Error> {
@@ -538,7 +505,7 @@ pub(crate) fn socketaddr_to_multiaddr<'a>(
         .with(Protocol::XWebRTC(fingerprint))
 }
 
-fn build_settings(udp_mux: Arc<dyn UDPMux + Send + Sync>) -> SettingEngine {
+pub fn build_settings(udp_mux: Arc<dyn UDPMux + Send + Sync>) -> SettingEngine {
     let mut se = SettingEngine::default();
 
     // Disable remote's fingerprint verification.

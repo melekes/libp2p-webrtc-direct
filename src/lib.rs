@@ -100,3 +100,4 @@ pub mod transport;
 
 mod sdp;
 mod udp_mux;
+mod upgrade;
