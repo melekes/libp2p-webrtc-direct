@@ -52,6 +52,9 @@ impl WebRTCUpgrade {
         let api = APIBuilder::new().with_setting_engine(se).build();
         let peer_connection = api.new_peer_connection(config).await?;
 
+        // Create a datachannel with label 'data'
+        let data_channel = peer_connection.create_data_channel("data", None).await?;
+
         peer_connection
             .on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
                 if s != RTCPeerConnectionState::Failed {
@@ -72,32 +75,21 @@ impl WebRTCUpgrade {
 
         let (data_channel_rx, data_channel_tx) = oneshot::channel::<Arc<DetachedDataChannel>>();
 
-        peer_connection
-            .on_data_channel(Box::new(move |d: Arc<RTCDataChannel>| {
-                let d_label = d.label().to_owned();
-                let d_id = d.id();
-                debug!("New DataChannel {} {}", d_label, d_id);
+        // Register channel opening handling
+        let d = Arc::clone(&data_channel);
+        data_channel
+            .on_open(Box::new(move || {
+                println!("Data channel '{}'-'{}' open.", d.label(), d.id());
 
-                // Register channel opening handling
+                let d2 = Arc::clone(&d);
                 Box::pin(async move {
-                    let d_label2 = d_label.clone();
-                    let d_id2 = d_id;
-                    let d2 = Arc::clone(&d);
-
-                    d.on_open(Box::new(move || {
-                        debug!("Data channel '{}'-'{}' open", d_label2, d_id2);
-
-                        Box::pin(async move {
-                            match d2.detach().await {
-                                // TODO: remove unwrap
-                                Ok(detached) => data_channel_rx.send(detached).unwrap(),
-                                Err(e) => {
-                                    error!("Can't detach data channel: {}", e);
-                                },
-                            };
-                        })
-                    }))
-                    .await;
+                    match d2.detach().await {
+                        // TODO: remove unwrap
+                        Ok(detached) => data_channel_rx.send(detached).unwrap(),
+                        Err(e) => {
+                            error!("Can't detach data channel: {}", e);
+                        },
+                    };
                 })
             }))
             .await;

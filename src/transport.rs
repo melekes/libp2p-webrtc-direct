@@ -91,7 +91,7 @@ enum InAddr {
 // A WebRTC connection.
 pub struct Connection {
     pub connection: RTCPeerConnection,
-    data_channel: Arc<DetachedDataChannel>,
+    pub data_channel: Arc<DetachedDataChannel>,
 }
 
 /// A WebRTC direct transport <https://webrtc.rs/> webrtc-rs library.
