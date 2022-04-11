@@ -1399,6 +1399,7 @@ dependencies = [
  "url",
  "webpki-roots",
  "webrtc",
+ "webrtc-data",
  "webrtc-dtls",
  "webrtc-ice",
  "webrtc-util",

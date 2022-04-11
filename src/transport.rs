@@ -18,6 +18,13 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
+// TODO:
+// - [ ] transform Connection for support AsyncWrite / AsyncRead
+// - [ ] make sure ufrag / psw are correct
+// - [ ] noise handshake on top of data channel
+// - [ ] peer ID
+// - [ ] notify about connection failure
+
 use libp2p_core::{
     address_translation,
     multiaddr::{Multiaddr, Protocol},
@@ -25,20 +32,24 @@ use libp2p_core::{
     Transport,
 };
 
-use futures::{channel::mpsc, future::BoxFuture, prelude::*, ready};
+use futures::{
+    channel::{mpsc, oneshot},
+    future::BoxFuture,
+    prelude::*,
+    ready,
+};
 use futures_timer::Delay;
 use if_watch::{IfEvent, IfWatcher};
 use log::{debug, error, trace};
 use tinytemplate::TinyTemplate;
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
-use webrtc::data_channel::data_channel_message::DataChannelMessage;
-use webrtc::data_channel::RTCDataChannel;
 use webrtc::dtls_transport::dtls_role::DTLSRole;
 use webrtc::peer_connection::certificate::RTCCertificate;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::RTCPeerConnection;
+use webrtc_data::data_channel::DataChannel as DetachedDataChannel;
 use webrtc_ice::udp_mux::UDPMux;
 use webrtc_ice::udp_network::UDPNetwork;
 
@@ -80,8 +91,7 @@ enum InAddr {
 // A WebRTC connection.
 pub struct Connection {
     pub connection: RTCPeerConnection,
-    // receiver: BoxStream<'static, Result<Incoming, connection::Error>>,
-    // sender: Pin<Box<dyn Sink<Outgoing, Error = connection::Error> + Send>>,
+    data_channel: Arc<DetachedDataChannel>,
 }
 
 /// A WebRTC direct transport <https://webrtc.rs/> webrtc-rs library.
@@ -177,6 +187,9 @@ pub struct WebRTCListenStream {
     config: RTCConfiguration,
     udp_mux: Arc<dyn UDPMux + Send + Sync>,
     new_addr_rx: mpsc::Receiver<SocketAddr>,
+    // TODO: track addresses we've already seen and do not upgrade them
+    // We need this because new addr might arrive while upgrade is in process for the same address.
+    // seen_addrs: HashSet<SocketAddr>,
 }
 
 impl WebRTCListenStream {
@@ -381,7 +394,9 @@ impl WebRTCDirectTransport {
             .map_err(Error::WebRTC)
             .await?;
 
-        // TODO: dedup
+        // Create a datachannel with label 'data'
+        let data_channel = peer_connection.create_data_channel("data", None).await?;
+
         peer_connection
             .on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
                 if s != RTCPeerConnectionState::Failed {
@@ -400,30 +415,23 @@ impl WebRTCDirectTransport {
             }))
             .await;
 
-        peer_connection
-            .on_data_channel(Box::new(move |d: Arc<RTCDataChannel>| {
-                let d_label = d.label().to_owned();
-                let d_id = d.id();
-                debug!("New DataChannel {} {}", d_label, d_id);
+        let (data_channel_rx, data_channel_tx) = oneshot::channel::<Arc<DetachedDataChannel>>();
 
-                // Register channel opening handling
+        // Register channel opening handling
+        let d = Arc::clone(&data_channel);
+        data_channel
+            .on_open(Box::new(move || {
+                println!("Data channel '{}'-'{}' open.", d.label(), d.id());
+
+                let d2 = Arc::clone(&d);
                 Box::pin(async move {
-                    // let d2 = Arc::clone(&d);
-                    let d_label2 = d_label.clone();
-                    let d_id2 = d_id;
-                    d.on_open(Box::new(move || {
-                        debug!("Data channel '{}'-'{}' open", d_label2, d_id2);
-                        Box::pin(async {})
-                    }))
-                    .await;
-
-                    // Register text message handling
-                    d.on_message(Box::new(move |msg: DataChannelMessage| {
-                        let msg_str = String::from_utf8(msg.data.to_vec()).unwrap();
-                        debug!("Message from DataChannel '{}': '{}'", d_label, msg_str);
-                        Box::pin(async {})
-                    }))
-                    .await;
+                    match d2.detach().await {
+                        // TODO: remove unwrap
+                        Ok(detached) => data_channel_rx.send(detached).unwrap(),
+                        Err(e) => {
+                            error!("Can't detach data channel: {}", e);
+                        },
+                    };
                 })
             }))
             .await;
@@ -451,8 +459,14 @@ impl WebRTCDirectTransport {
             .map_err(Error::WebRTC)
             .await?;
 
+        // wait until data channel is opened and ready to use
+        let data_channel = data_channel_tx
+            .map_err(|e| Error::InternalError(e.to_string()))
+            .await?;
+
         Ok(Connection {
             connection: peer_connection,
+            data_channel,
         })
     }
 }

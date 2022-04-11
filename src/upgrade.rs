@@ -18,14 +18,15 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
+use futures::channel::oneshot;
+use futures::TryFutureExt;
 use log::{debug, error};
 use webrtc::api::APIBuilder;
-use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::dtls_transport::dtls_role::DTLSRole;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
-use webrtc::peer_connection::RTCPeerConnection;
+use webrtc_data::data_channel::DataChannel as DetachedDataChannel;
 use webrtc_ice::udp_mux::UDPMux;
 
 use std::net::SocketAddr;
@@ -69,6 +70,8 @@ impl WebRTCUpgrade {
             }))
             .await;
 
+        let (data_channel_rx, data_channel_tx) = oneshot::channel::<Arc<DetachedDataChannel>>();
+
         peer_connection
             .on_data_channel(Box::new(move |d: Arc<RTCDataChannel>| {
                 let d_label = d.label().to_owned();
@@ -77,20 +80,22 @@ impl WebRTCUpgrade {
 
                 // Register channel opening handling
                 Box::pin(async move {
-                    // let d2 = Arc::clone(&d);
                     let d_label2 = d_label.clone();
                     let d_id2 = d_id;
+                    let d2 = Arc::clone(&d);
+
                     d.on_open(Box::new(move || {
                         debug!("Data channel '{}'-'{}' open", d_label2, d_id2);
-                        Box::pin(async {})
-                    }))
-                    .await;
 
-                    // Register text message handling
-                    d.on_message(Box::new(move |msg: DataChannelMessage| {
-                        let msg_str = String::from_utf8(msg.data.to_vec()).unwrap();
-                        debug!("Message from DataChannel '{}': '{}'", d_label, msg_str);
-                        Box::pin(async {})
+                        Box::pin(async move {
+                            match d2.detach().await {
+                                // TODO: remove unwrap
+                                Ok(detached) => data_channel_rx.send(detached).unwrap(),
+                                Err(e) => {
+                                    error!("Can't detach data channel: {}", e);
+                                },
+                            };
+                        })
                     }))
                     .await;
                 })
@@ -100,6 +105,8 @@ impl WebRTCUpgrade {
         // Set the remote description to the predefined SDP
         let mut offer = peer_connection.create_offer(None).await?;
         offer.sdp = sdp::CLIENT_SESSION_DESCRIPTION.to_string();
+        // TODO: - set IN IP4 {REMOTE_IP}
+        //       - set ufrag and pwd to fingerprint
         debug!("REMOTE OFFER: {:?}", offer);
         peer_connection.set_remote_description(offer).await?;
 
@@ -109,8 +116,14 @@ impl WebRTCUpgrade {
         debug!("LOCAL ANSWER: {:?}", answer);
         peer_connection.set_local_description(answer).await?;
 
+        // wait until data channel is opened and ready to use
+        let data_channel = data_channel_tx
+            .map_err(|e| Error::InternalError(e.to_string()))
+            .await?;
+
         Ok(Connection {
             connection: peer_connection,
+            data_channel,
         })
     }
 }

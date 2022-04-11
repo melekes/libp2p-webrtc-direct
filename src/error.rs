@@ -29,4 +29,6 @@ pub enum Error {
     WebRTC(#[from] webrtc::Error),
     #[error("io error: {0}")]
     IoError(#[from] std::io::Error),
+    #[error("internal error: {0} (see debug logs)")]
+    InternalError(String),
 }
