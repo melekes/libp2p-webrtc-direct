@@ -19,7 +19,7 @@
 // DEALINGS IN THE SOFTWARE.
 
 // TODO:
-// - [ ] transform Connection for support AsyncWrite / AsyncRead
+// - [x] transform Connection for support AsyncWrite / AsyncRead
 // - [ ] make sure ufrag / psw are correct
 // - [ ] noise handshake on top of data channel
 // - [ ] peer ID
@@ -48,16 +48,12 @@ use webrtc::dtls_transport::dtls_role::DTLSRole;
 use webrtc::peer_connection::certificate::RTCCertificate;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
-use webrtc::peer_connection::RTCPeerConnection;
 use webrtc_data::data_channel::DataChannel as DetachedDataChannel;
 use webrtc_ice::udp_mux::UDPMux;
 use webrtc_ice::udp_network::UDPNetwork;
 
 #[cfg(feature = "tokio")]
 use tokio_crate::net::{ToSocketAddrs, UdpSocket};
-
-#[cfg(feature = "async-std")]
-use async_std_crate::net::{ToSocketAddrs, UdpSocket};
 
 use std::borrow::Cow;
 use std::io;
@@ -71,6 +67,7 @@ use std::time::Duration;
 use crate::error::Error;
 use crate::sdp;
 
+use crate::connection::Connection;
 use crate::udp_mux::UDPMuxNewAddr;
 use crate::udp_mux::UDPMuxParams;
 use crate::upgrade::WebRTCUpgrade;
@@ -86,12 +83,6 @@ enum InAddr {
     One { out: Option<Multiaddr> },
     /// The stream accepts connections on all interfaces.
     Any { if_watch: IfWatch },
-}
-
-// A WebRTC connection.
-pub struct Connection {
-    pub connection: RTCPeerConnection,
-    pub data_channel: Arc<DetachedDataChannel>,
 }
 
 /// A WebRTC direct transport <https://webrtc.rs/> webrtc-rs library.
@@ -133,7 +124,7 @@ impl WebRTCDirectTransport {
 }
 
 impl Transport for WebRTCDirectTransport {
-    type Output = Connection;
+    type Output = Connection<'static>;
     type Error = Error;
     type Listener = WebRTCListenStream;
     type ListenerUpgrade = BoxFuture<'static, Result<Self::Output, Self::Error>>;
@@ -230,7 +221,8 @@ impl WebRTCListenStream {
 }
 
 impl Stream for WebRTCListenStream {
-    type Item = Result<ListenerEvent<BoxFuture<'static, Result<Connection, Error>>, Error>, Error>;
+    type Item =
+        Result<ListenerEvent<BoxFuture<'static, Result<Connection<'static>, Error>>, Error>, Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         let me = Pin::into_inner(self);
@@ -337,7 +329,7 @@ impl Stream for WebRTCListenStream {
 }
 
 impl WebRTCDirectTransport {
-    async fn do_dial(self, addr: Multiaddr) -> Result<Connection, Error> {
+    async fn do_dial(self, addr: Multiaddr) -> Result<Connection<'static>, Error> {
         log::debug!("dialing {}", addr);
         let mut inner_addr = addr.clone();
 
@@ -372,6 +364,7 @@ impl WebRTCDirectTransport {
                 target_port: socket_addr.port(),
                 fingerprint: hex::encode(fingerprint.as_ref()),
             };
+            // TODO: - set ufrag and pwd to fingerprint
             tt.render("description", &context).unwrap()
         };
 
@@ -464,10 +457,7 @@ impl WebRTCDirectTransport {
             .map_err(|e| Error::InternalError(e.to_string()))
             .await?;
 
-        Ok(Connection {
-            connection: peer_connection,
-            data_channel,
-        })
+        Ok(Connection::new(peer_connection, data_channel))
     }
 }
 
@@ -558,10 +548,10 @@ mod tests {
                     .parse::<Multiaddr>()
                     .unwrap()
             ),
-            Some(( SocketAddr::new(
-                        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-                        12345,
-            ) ))
+            Some( SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                    12345,
+            ) )
         );
 
         assert_eq!(
@@ -570,10 +560,10 @@ mod tests {
                     .parse::<Multiaddr>()
                     .unwrap()
             ),
-            Some(( SocketAddr::new(
-                        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-                        12345,
-            ) ))
+            Some(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                    12345,
+            ))
         );
 
         assert!(multiaddr_to_socketaddr(
@@ -589,10 +579,10 @@ mod tests {
                     .parse::<Multiaddr>()
                     .unwrap()
             ),
-            Some(( SocketAddr::new(
-                        IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)),
-                        8080,
-            ) ))
+            Some(SocketAddr::new(
+                    IpAddr::V4(Ipv4Addr::new(255, 255, 255, 255)),
+                    8080,
+            ))
         );
         assert_eq!(
             multiaddr_to_socketaddr(
@@ -600,10 +590,10 @@ mod tests {
                     .parse::<Multiaddr>()
                     .unwrap()
             ),
-            Some(( SocketAddr::new(
-                        IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)),
-                        12345,
-            ) ))
+            Some( SocketAddr::new(
+                    IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)),
+                    12345,
+            ) )
         );
         assert_eq!(
             multiaddr_to_socketaddr(
@@ -611,12 +601,12 @@ mod tests {
                     .parse::<Multiaddr>()
                     .unwrap()
             ),
-            Some(( SocketAddr::new(
-                        IpAddr::V6(Ipv6Addr::new(
-                                65535, 65535, 65535, 65535, 65535, 65535, 65535, 65535,
-                        )),
-                        8080,
-            ) ))
+            Some( SocketAddr::new(
+                    IpAddr::V6(Ipv6Addr::new(
+                            65535, 65535, 65535, 65535, 65535, 65535, 65535, 65535,
+                    )),
+                    8080,
+            ) )
         );
     }
 

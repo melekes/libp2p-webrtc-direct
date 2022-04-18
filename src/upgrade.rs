@@ -22,7 +22,6 @@ use futures::channel::oneshot;
 use futures::TryFutureExt;
 use log::{debug, error};
 use webrtc::api::APIBuilder;
-use webrtc::data_channel::RTCDataChannel;
 use webrtc::dtls_transport::dtls_role::DTLSRole;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
@@ -32,10 +31,10 @@ use webrtc_ice::udp_mux::UDPMux;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use crate::connection::Connection;
 use crate::error::Error;
 use crate::sdp;
 use crate::transport::build_settings;
-use crate::transport::Connection;
 
 pub struct WebRTCUpgrade {}
 
@@ -44,7 +43,7 @@ impl WebRTCUpgrade {
         udp_mux: Arc<dyn UDPMux + Send + Sync>,
         config: RTCConfiguration,
         socket_addr: SocketAddr,
-    ) -> Result<Connection, Error> {
+    ) -> Result<Connection<'static>, Error> {
         let mut se = build_settings(udp_mux);
         // Act as a DTLS server (one which waits for a connection).
         se.set_answering_dtls_role(DTLSRole::Server)?;
@@ -113,9 +112,6 @@ impl WebRTCUpgrade {
             .map_err(|e| Error::InternalError(e.to_string()))
             .await?;
 
-        Ok(Connection {
-            connection: peer_connection,
-            data_channel,
-        })
+        Ok(Connection::new(peer_connection, data_channel))
     }
 }

@@ -38,6 +38,7 @@ webrtc = { version = "0.4.0", git = "https://github.com/melekes/webrtc", branch 
 webrtc-dtls = "0.5.2"
 webrtc-ice = "0.6.6"
 webrtc-data = "0.3.3"
+webrtc-sctp = "0.4.3"
 if-watch = "0.2.2"
 futures-timer = "3.0"
 stun = "0.4.2"

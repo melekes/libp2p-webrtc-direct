@@ -95,6 +95,7 @@
 //! For now we'll start an encryption protocol handshake on top of the single data channel. Once
 //! this handshake has been successful, we stop it and just use DTLS.
 
+pub mod connection;
 pub mod error;
 pub mod transport;
 
