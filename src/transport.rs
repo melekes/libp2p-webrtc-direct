@@ -91,6 +91,9 @@ pub struct WebRTCDirectTransport {
     /// The `UDPMux` that manages all ICE connections.
     udp_mux: Arc<dyn UDPMux + Send + Sync>,
 
+    /// The local address of `udp_mux`.
+    udp_mux_addr: SocketAddr,
+
     /// The receiver for new `SocketAddr` connecting to this peer.
     new_addr_rx: Arc<Mutex<mpsc::Receiver<SocketAddr>>>,
 }
@@ -98,16 +101,20 @@ pub struct WebRTCDirectTransport {
 impl WebRTCDirectTransport {
     /// Create a new WebRTC transport.
     ///
-    /// Creates a UDP socket bound to `addr`.
+    /// Creates a UDP socket bound to `listen_addr`. `listen_on` must be called to start listening.
     pub async fn new<A: ToSocketAddrs>(
         certificate: RTCCertificate,
-        addr: A,
+        listen_addr: A,
     ) -> Result<Self, TransportError<Error>> {
-        // bind to `addr` and construct a UDP mux.
-        let socket = UdpSocket::bind(addr)
+        // bind to `listen_addr` and construct a UDP mux.
+        let socket = UdpSocket::bind(listen_addr)
             .map_err(Error::IoError)
             .map_err(TransportError::Other)
             .await?;
+        let udp_mux_addr = socket
+            .local_addr()
+            .map_err(Error::IoError)
+            .map_err(TransportError::Other)?;
         let (new_addr_tx, new_addr_rx) = mpsc::channel(1);
         let udp_mux = UDPMuxNewAddr::new(UDPMuxParams::new(socket), new_addr_tx);
 
@@ -117,6 +124,7 @@ impl WebRTCDirectTransport {
                 ..Default::default()
             },
             udp_mux,
+            udp_mux_addr,
             new_addr_rx: Arc::new(Mutex::new(new_addr_rx)),
         })
     }
@@ -130,12 +138,9 @@ impl Transport for WebRTCDirectTransport {
     type Dial = BoxFuture<'static, Result<Self::Output, Self::Error>>;
 
     fn listen_on(self, addr: Multiaddr) -> Result<Self::Listener, TransportError<Self::Error>> {
-        let socket_addr = multiaddr_to_socketaddr(&addr)
-            .ok_or_else(|| TransportError::MultiaddrNotSupported(addr))?;
-        log::debug!("listening on {}", socket_addr);
-
+        log::debug!("listening on {} (ignoring {})", self.udp_mux_addr, addr);
         Ok(WebRTCListenStream::new(
-            socket_addr,
+            self.udp_mux_addr,
             self.config.clone(),
             self.udp_mux.clone(),
             self.new_addr_rx.clone(),
@@ -173,8 +178,11 @@ pub struct WebRTCListenStream {
     /// The current pause, if any.
     pause: Option<Delay>,
 
+    /// A `RTCConfiguration` which holds this peer's certificate(s).
     config: RTCConfiguration,
+    /// The `UDPMux` that manages all ICE connections.
     udp_mux: Arc<dyn UDPMux + Send + Sync>,
+    /// The receiver for new `SocketAddr` connecting to this peer.
     new_addr_rx: Arc<Mutex<mpsc::Receiver<SocketAddr>>>,
     // TODO: track addresses we've already seen and do not upgrade them
     // We need this because new addr might arrive while upgrade is in process for the same address.
@@ -255,7 +263,6 @@ impl Stream for WebRTCListenStream {
                                     if me.listen_addr.is_ipv4() == ip.is_ipv4()
                                         || me.listen_addr.is_ipv6() == ip.is_ipv6()
                                     {
-                                        // TODO: include fingerprint?
                                         let ma = ip_to_multiaddr(ip, me.listen_addr.port());
                                         log::debug!("New listen address: {}", ma);
                                         return Poll::Ready(Some(Ok(ListenerEvent::NewAddress(
@@ -268,7 +275,6 @@ impl Stream for WebRTCListenStream {
                                     if me.listen_addr.is_ipv4() == ip.is_ipv4()
                                         || me.listen_addr.is_ipv6() == ip.is_ipv6()
                                     {
-                                        // TODO: include fingerprint?
                                         let ma = ip_to_multiaddr(ip, me.listen_addr.port());
                                         log::debug!("Expired listen address: {}", ma);
                                         return Poll::Ready(Some(Ok(
@@ -642,12 +648,6 @@ mod tests {
             .into_new_address()
             .expect("listen address");
 
-        assert_eq!(
-            Some(Protocol::XWebRTC(hex_to_cow(
-                "ACD1E533EC271FCDE0275947F4D62A2B2331FF10C9DDE0298EB7B399B4BFF60B"
-            ))),
-            addr.iter().nth(2)
-        );
         assert_ne!(Some(Protocol::Udp(0)), addr.iter().nth(1));
 
         let inbound = async move {
@@ -661,7 +661,9 @@ mod tests {
         };
 
         let outbound = transport
-            .dial(addr.with(Protocol::P2p(PeerId::random().into())))
+            .dial(addr.with(Protocol::XWebRTC(hex_to_cow(
+                "ACD1E533EC271FCDE0275947F4D62A2B2331FF10C9DDE0298EB7B399B4BFF60B",
+            ))))
             .unwrap();
 
         let (a, b) = futures::join!(inbound, outbound);
