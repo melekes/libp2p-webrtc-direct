@@ -390,17 +390,7 @@ impl WebRTCDirectTransport {
 
         peer_connection
             .on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
-                if s != RTCPeerConnectionState::Failed {
-                    debug!("Peer Connection State has changed: {}", s);
-                } else {
-                    // Wait until PeerConnection has had no network activity for 30 seconds or another
-                    // failure. It may be reconnected using an ICE Restart. Use
-                    // webrtc.PeerConnectionStateDisconnected if you are interested in detecting faster
-                    // timeout. Note that the PeerConnection may come back from
-                    // PeerConnectionStateDisconnected.
-                    error!("Peer Connection has gone to failed => exiting");
-                    // TODO: stop listening?
-                }
+                debug!("Peer Connection State has changed: {}", s);
 
                 Box::pin(async {})
             }))
@@ -635,9 +625,12 @@ mod tests {
     async fn connect(listen_addr: Multiaddr) {
         let kp = KeyPair::generate(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key pair");
         let cert = RTCCertificate::from_key_pair(kp).expect("certificate");
-        let transport = WebRTCDirectTransport::new(cert, "127.0.0.1:0")
-            .await
-            .expect("transport");
+        let transport = WebRTCDirectTransport::new(
+            cert,
+            multiaddr_to_socketaddr(&listen_addr).expect("socket addr"),
+        )
+        .await
+        .expect("transport");
 
         let mut listener = transport.clone().listen_on(listen_addr).expect("listener");
 

@@ -42,6 +42,7 @@ impl WebRTCUpgrade {
     pub async fn new(
         udp_mux: Arc<dyn UDPMux + Send + Sync>,
         config: RTCConfiguration,
+        // TODO: use socket_addr
         socket_addr: SocketAddr,
     ) -> Result<Connection<'static>, Error> {
         let mut se = build_settings(udp_mux);
@@ -56,17 +57,7 @@ impl WebRTCUpgrade {
 
         peer_connection
             .on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
-                if s != RTCPeerConnectionState::Failed {
-                    debug!("Peer Connection State has changed: {}", s);
-                } else {
-                    // Wait until PeerConnection has had no network activity for 30 seconds or another
-                    // failure. It may be reconnected using an ICE Restart. Use
-                    // webrtc.PeerConnectionStateDisconnected if you are interested in detecting faster
-                    // timeout. Note that the PeerConnection may come back from
-                    // PeerConnectionStateDisconnected.
-                    error!("Peer Connection has gone to failed => exiting");
-                    // TODO: stop listening?
-                }
+                debug!("Peer Connection State has changed: {}", s);
 
                 Box::pin(async {})
             }))

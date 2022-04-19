@@ -30,6 +30,35 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+/// Default capacity of the temporary read buffer used by [`PollStream`].
+const DEFAULT_READ_BUF_SIZE: usize = 4096;
+
+/// State of the read `Future` in [`PollStream`].
+enum ReadFut<'a> {
+    /// Nothing in progress.
+    Idle,
+    /// Reading data from the underlying stream.
+    Reading(Pin<Box<dyn Future<Output = Result<Vec<u8>, Error>> + Send + 'a>>),
+    /// Finished reading, but there's unread data in the temporary buffer.
+    RemainingData(Vec<u8>),
+}
+
+impl<'a> ReadFut<'a> {
+    /// Gets a mutable reference to the future stored inside `Reading(future)`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `ReadFut` variant is not `Reading`.
+    fn get_reading_mut(
+        &mut self,
+    ) -> &mut Pin<Box<dyn Future<Output = Result<Vec<u8>, Error>> + Send + 'a>> {
+        match self {
+            ReadFut::Reading(ref mut fut) => fut,
+            _ => panic!("expected ReadFut to be Reading"),
+        }
+    }
+}
+
 /// A wrapper around around [`DataChannel`], which implements [`AsyncRead`] and
 /// [`AsyncWrite`].
 ///
@@ -38,9 +67,11 @@ use std::task::{Context, Poll};
 pub struct PollDataChannel<'a> {
     data_channel: Arc<DataChannel>,
 
-    read_fut: Option<Pin<Box<dyn Future<Output = Result<Vec<u8>, Error>> + Send + 'a>>>,
+    read_fut: ReadFut<'a>,
     write_fut: Option<Pin<Box<dyn Future<Output = Result<usize, Error>> + Send + 'a>>>,
     shutdown_fut: Option<Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>>,
+
+    read_buf_cap: usize,
 }
 
 impl PollDataChannel<'_> {
@@ -48,9 +79,10 @@ impl PollDataChannel<'_> {
     pub fn new(data_channel: Arc<DataChannel>) -> Self {
         Self {
             data_channel,
-            read_fut: None,
+            read_fut: ReadFut::Idle,
             write_fut: None,
             shutdown_fut: None,
+            read_buf_cap: DEFAULT_READ_BUF_SIZE,
         }
     }
 
@@ -63,6 +95,11 @@ impl PollDataChannel<'_> {
     pub fn clone_inner(&self) -> Arc<DataChannel> {
         self.data_channel.clone()
     }
+
+    /// Set the capacity of the temporary read buffer (default: 4096).
+    pub fn set_read_buf_capacity(&mut self, capacity: usize) {
+        self.read_buf_cap = capacity
+    }
 }
 
 impl AsyncRead for PollDataChannel<'_> {
@@ -71,14 +108,13 @@ impl AsyncRead for PollDataChannel<'_> {
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        let fut = match self.read_fut.as_mut() {
-            Some(fut) => fut,
-            None => {
-                // read into a temporary buffer because `buf` has an unonymous lifetime, which can be
-                // shorter than the lifetime of `read_fut`.
+        let fut = match self.read_fut {
+            ReadFut::Idle => {
+                // read into a temporary buffer because `buf` has an unonymous lifetime, which can
+                // be shorter than the lifetime of `read_fut`.
                 let dc = self.data_channel.clone();
-                let mut temp_buf = vec![0; buf.len()];
-                self.read_fut.get_or_insert(Box::pin(async move {
+                let mut temp_buf = vec![0; self.read_buf_cap];
+                self.read_fut = ReadFut::Reading(Box::pin(async move {
                     let res = dc.read(temp_buf.as_mut_slice()).await;
                     match res {
                         Ok(n) => {
@@ -87,7 +123,21 @@ impl AsyncRead for PollDataChannel<'_> {
                         },
                         Err(e) => Err(e),
                     }
-                }))
+                }));
+                self.read_fut.get_reading_mut()
+            },
+            ReadFut::Reading(ref mut fut) => fut,
+            ReadFut::RemainingData(ref mut data) => {
+                let remaining = buf.len();
+                let len = std::cmp::min(data.len(), remaining);
+                buf.copy_from_slice(&data[..len]);
+                if data.len() > remaining {
+                    // ReadFut remains to be RemainingData
+                    data.drain(0..len);
+                } else {
+                    self.read_fut = ReadFut::Idle;
+                }
+                return Poll::Ready(Ok(len));
             },
         };
 
@@ -99,17 +149,23 @@ impl AsyncRead for PollDataChannel<'_> {
                 Poll::Ready(Err(Error::Sctp(webrtc_sctp::Error::ErrTryAgain))) => {},
                 // EOF has been reached => don't touch buf and just return Ok
                 Poll::Ready(Err(Error::Sctp(webrtc_sctp::Error::ErrEof))) => {
-                    self.read_fut = None;
+                    self.read_fut = ReadFut::Idle;
                     return Poll::Ready(Ok(0));
                 },
                 Poll::Ready(Err(e)) => {
-                    self.read_fut = None;
+                    self.read_fut = ReadFut::Idle;
                     return Poll::Ready(Err(webrtc_error_to_io(e)));
                 },
-                Poll::Ready(Ok(read_buf)) => {
-                    let len = std::cmp::min(read_buf.len(), buf.len());
-                    buf.copy_from_slice(&read_buf[..len]);
-                    self.read_fut = None;
+                Poll::Ready(Ok(mut temp_buf)) => {
+                    let remaining = buf.len();
+                    let len = std::cmp::min(temp_buf.len(), remaining);
+                    buf.copy_from_slice(&temp_buf[..len]);
+                    if temp_buf.len() > remaining {
+                        temp_buf.drain(0..len);
+                        self.read_fut = ReadFut::RemainingData(temp_buf);
+                    } else {
+                        self.read_fut = ReadFut::Idle;
+                    }
                     return Poll::Ready(Ok(len));
                 },
             }
