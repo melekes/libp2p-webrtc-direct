@@ -9,9 +9,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-# TODO: update after the protocol is added to the main repo
 anyhow = "1.0.56"
-async-std-crate = {  package = "async-std", version = "1.10.0", features = ["attributes", "tokio1"], optional = true }
 bytes = "1"
 chrono = "0.4.19"
 clap = { version = "3.1.6", features = ["derive"] }
@@ -31,7 +29,7 @@ rw-stream-sink = "0.2.0"
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "1"
 tinytemplate = "1.2"
-tokio-crate = { package = "tokio", version = "1.17.0", default-features = false, features = ["net"], optional = true }
+tokio-crate = { package = "tokio", version = "1.17.0", default-features = false, features = ["net"]}
 url = "2.1"
 webpki-roots = "0.22"
 webrtc = { version = "0.4.0", git = "https://github.com/melekes/webrtc", branch = "anton/168-allow-persistent-certificates" }
@@ -44,8 +42,3 @@ futures-timer = "3.0"
 stun = "0.4.2"
 webrtc-util = { version = "0.5.3", default-features = false, features = ["conn", "vnet", "sync"] }
 async-trait = "0.1.52"
-
-[features]
-default = ["tokio"]
-tokio = ["tokio-crate"]
-async-std = ["async-std-crate"]

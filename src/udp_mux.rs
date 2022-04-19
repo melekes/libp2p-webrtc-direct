@@ -26,9 +26,7 @@ use futures::channel::mpsc;
 use webrtc_ice::udp_mux::UDPMux;
 use webrtc_util::{sync::RwLock, Conn, Error};
 
-#[cfg(feature = "tokio")]
 use tokio_crate as tokio;
-#[cfg(feature = "tokio")]
 use tokio_crate::sync::{watch, Mutex};
 
 mod socket_addr_ext;

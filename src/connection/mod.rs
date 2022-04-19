@@ -32,16 +32,19 @@ use std::task::{Context, Poll};
 
 use poll_data_channel::PollDataChannel;
 
-// A WebRTC connection.
+/// A WebRTC connection over a single data channel. See lib documentation for
+/// the reasoning as to why a single data channel is being used.
 pub struct Connection<'a> {
-    connection: RTCPeerConnection,
-    data_channel: PollDataChannel<'a>,
+    /// `RTCPeerConnection` to the remote peer.
+    pub inner: RTCPeerConnection,
+    /// A data channel.
+    pub data_channel: PollDataChannel<'a>,
 }
 
 impl Connection<'_> {
-    pub fn new(connection: RTCPeerConnection, data_channel: Arc<DataChannel>) -> Self {
+    pub fn new(peer_conn: RTCPeerConnection, data_channel: Arc<DataChannel>) -> Self {
         Self {
-            connection,
+            inner: peer_conn,
             data_channel: PollDataChannel::new(data_channel),
         }
     }

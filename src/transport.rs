@@ -18,12 +18,10 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-// TODO:
-// - [x] transform Connection for support AsyncWrite / AsyncRead
+// What's left:
 // - [ ] make sure ufrag / psw are correct
 // - [ ] noise handshake on top of data channel
 // - [ ] peer ID
-// - [ ] notify about connection failure
 
 use libp2p_core::{
     address_translation,
@@ -52,7 +50,6 @@ use webrtc_data::data_channel::DataChannel as DetachedDataChannel;
 use webrtc_ice::udp_mux::UDPMux;
 use webrtc_ice::udp_network::UDPNetwork;
 
-#[cfg(feature = "tokio")]
 use tokio_crate::net::{ToSocketAddrs, UdpSocket};
 
 use std::borrow::Cow;
@@ -60,7 +57,7 @@ use std::io;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -85,11 +82,17 @@ enum InAddr {
     Any { if_watch: IfWatch },
 }
 
-/// A WebRTC direct transport <https://webrtc.rs/> webrtc-rs library.
+/// A WebRTC direct transport.
+#[derive(Clone)]
 pub struct WebRTCDirectTransport {
+    /// A `RTCConfiguration` which holds this peer's certificate(s).
     config: RTCConfiguration,
+
+    /// The `UDPMux` that manages all ICE connections.
     udp_mux: Arc<dyn UDPMux + Send + Sync>,
-    new_addr_rx: mpsc::Receiver<SocketAddr>,
+
+    /// The receiver for new `SocketAddr` connecting to this peer.
+    new_addr_rx: Arc<Mutex<mpsc::Receiver<SocketAddr>>>,
 }
 
 impl WebRTCDirectTransport {
@@ -100,14 +103,7 @@ impl WebRTCDirectTransport {
         certificate: RTCCertificate,
         addr: A,
     ) -> Result<Self, TransportError<Error>> {
-        // Create a webrtc config with the given certificate, which will be used for all DTLS
-        // handshakes.
-        let config = RTCConfiguration {
-            certificates: vec![certificate],
-            ..Default::default()
-        };
-
-        // Create a UDP mux, which will be used across all connections.
+        // bind to `addr` and construct a UDP mux.
         let socket = UdpSocket::bind(addr)
             .map_err(Error::IoError)
             .map_err(TransportError::Other)
@@ -116,9 +112,12 @@ impl WebRTCDirectTransport {
         let udp_mux = UDPMuxNewAddr::new(UDPMuxParams::new(socket), new_addr_tx);
 
         Ok(Self {
-            config,
+            config: RTCConfiguration {
+                certificates: vec![certificate],
+                ..Default::default()
+            },
             udp_mux,
-            new_addr_rx,
+            new_addr_rx: Arc::new(Mutex::new(new_addr_rx)),
         })
     }
 }
@@ -139,7 +138,7 @@ impl Transport for WebRTCDirectTransport {
             socket_addr,
             self.config.clone(),
             self.udp_mux.clone(),
-            self.new_addr_rx,
+            self.new_addr_rx.clone(),
         ))
     }
 
@@ -174,10 +173,9 @@ pub struct WebRTCListenStream {
     /// The current pause, if any.
     pause: Option<Delay>,
 
-    // TODO: why copy from WebRTCDirectTransport
     config: RTCConfiguration,
     udp_mux: Arc<dyn UDPMux + Send + Sync>,
-    new_addr_rx: mpsc::Receiver<SocketAddr>,
+    new_addr_rx: Arc<Mutex<mpsc::Receiver<SocketAddr>>>,
     // TODO: track addresses we've already seen and do not upgrade them
     // We need this because new addr might arrive while upgrade is in process for the same address.
     // seen_addrs: HashSet<SocketAddr>,
@@ -190,7 +188,7 @@ impl WebRTCListenStream {
         listen_addr: SocketAddr,
         config: RTCConfiguration,
         udp_mux: Arc<dyn UDPMux + Send + Sync>,
-        new_addr_rx: mpsc::Receiver<SocketAddr>,
+        new_addr_rx: Arc<Mutex<mpsc::Receiver<SocketAddr>>>,
     ) -> Self {
         // Check whether the listening IP is set or not.
         let in_addr = if match &listen_addr {
@@ -311,7 +309,7 @@ impl Stream for WebRTCListenStream {
                 }
             }
 
-            return match Pin::new(&mut me.new_addr_rx).poll_next(cx) {
+            return match Pin::new(&mut *me.new_addr_rx.lock().unwrap()).poll_next(cx) {
                 Poll::Ready(Some(socket_addr)) => Poll::Ready(Some(Ok(ListenerEvent::Upgrade {
                     local_addr: ip_to_multiaddr(me.listen_addr.ip(), me.listen_addr.port()),
                     remote_addr: ip_to_multiaddr(socket_addr.ip(), socket_addr.port()),
@@ -488,18 +486,12 @@ fn multiaddr_to_socketaddr(addr: &Multiaddr) -> Option<SocketAddr> {
         (Protocol::Ip6(ip), Protocol::Udp(port), Protocol::XWebRTC(_)) => {
             Some(SocketAddr::new(ip.into(), port))
         },
-        (Protocol::Ip4(ip), Protocol::Tcp(port), Protocol::XWebRTC(_)) => {
-            Some(SocketAddr::new(ip.into(), port))
-        },
-        (Protocol::Ip6(ip), Protocol::Tcp(port), Protocol::XWebRTC(_)) => {
-            Some(SocketAddr::new(ip.into(), port))
-        },
         _ => None,
     }
 }
 
 /// Turns an IP address and port into the corresponding WebRTC multiaddr.
-pub(crate) fn socketaddr_to_multiaddr<'a>(
+fn socketaddr_to_multiaddr<'a>(
     socket_addr: &SocketAddr,
     fingerprint: Cow<'a, [u8; 32]>,
 ) -> Multiaddr {
@@ -532,8 +524,11 @@ pub fn build_settings(udp_mux: Arc<dyn UDPMux + Send + Sync>) -> SettingEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libp2p_core::{multiaddr::Protocol, Multiaddr, PeerId, Transport};
+    use rcgen::KeyPair;
     use std::net::IpAddr;
     use std::net::{Ipv4Addr, Ipv6Addr};
+    use tokio_crate as tokio;
 
     #[test]
     fn multiaddr_to_socketaddr_conversion() {
@@ -544,7 +539,7 @@ mod tests {
 
         assert_eq!(
             multiaddr_to_socketaddr(
-                &"/ip4/127.0.0.1/tcp/12345/x-webrtc/ACD1E533EC271FCDE0275947F4D62A2B2331FF10C9DDE0298EB7B399B4BFF60B"
+                &"/ip4/127.0.0.1/udp/12345/x-webrtc/ACD1E533EC271FCDE0275947F4D62A2B2331FF10C9DDE0298EB7B399B4BFF60B"
                     .parse::<Multiaddr>()
                     .unwrap()
             ),
@@ -554,16 +549,12 @@ mod tests {
             ) )
         );
 
-        assert_eq!(
+        assert!(
             multiaddr_to_socketaddr(
                 &"/ip4/127.0.0.1/tcp/12345/x-webrtc/ACD1E533EC271FCDE0275947F4D62A2B2331FF10C9DDE0298EB7B399B4BFF60B"
                     .parse::<Multiaddr>()
                     .unwrap()
-            ),
-            Some(SocketAddr::new(
-                    IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-                    12345,
-            ))
+            ).is_none()
         );
 
         assert!(multiaddr_to_socketaddr(
@@ -597,7 +588,7 @@ mod tests {
         );
         assert_eq!(
             multiaddr_to_socketaddr(
-                &"/ip6/ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff/tcp/8080/x-webrtc/ACD1E533EC271FCDE0275947F4D62A2B2331FF10C9DDE0298EB7B399B4BFF60B"
+                &"/ip6/ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff/udp/8080/x-webrtc/ACD1E533EC271FCDE0275947F4D62A2B2331FF10C9DDE0298EB7B399B4BFF60B"
                     .parse::<Multiaddr>()
                     .unwrap()
             ),
@@ -623,9 +614,64 @@ mod tests {
                 &SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345,),
                 hex_to_cow("ACD1E533EC271FCDE0275947F4D62A2B2331FF10C9DDE0298EB7B399B4BFF60B"),
             ),
-            "/ip4/127.0.0.1/tcp/12345/x-webrtc/ACD1E533EC271FCDE0275947F4D62A2B2331FF10C9DDE0298EB7B399B4BFF60B"
+            "/ip4/127.0.0.1/udp/12345/x-webrtc/ACD1E533EC271FCDE0275947F4D62A2B2331FF10C9DDE0298EB7B399B4BFF60B"
                 .parse::<Multiaddr>()
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn dialer_connects_to_listener_ipv4() {
+        let a = "/ip4/127.0.0.1/udp/0/x-webrtc/ACD1E533EC271FCDE0275947F4D62A2B2331FF10C9DDE0298EB7B399B4BFF60B".parse().unwrap();
+        connect(a).await
+    }
+
+    #[tokio::test]
+    async fn dialer_connects_to_listener_ipv6() {
+        let a = "/ip6/::1/udp/0/x-webrtc/ACD1E533EC271FCDE0275947F4D62A2B2331FF10C9DDE0298EB7B399B4BFF60B".parse().unwrap();
+        connect(a).await;
+    }
+
+    async fn connect(listen_addr: Multiaddr) {
+        let kp = KeyPair::generate(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key pair");
+        let cert = RTCCertificate::from_key_pair(kp).expect("certificate");
+        let transport = WebRTCDirectTransport::new(cert, "127.0.0.1:0")
+            .await
+            .expect("transport");
+
+        let mut listener = transport.clone().listen_on(listen_addr).expect("listener");
+
+        let addr = listener
+            .try_next()
+            .await
+            .expect("some event")
+            .expect("no error")
+            .into_new_address()
+            .expect("listen address");
+
+        assert_eq!(
+            Some(Protocol::XWebRTC(hex_to_cow(
+                "ACD1E533EC271FCDE0275947F4D62A2B2331FF10C9DDE0298EB7B399B4BFF60B"
+            ))),
+            addr.iter().nth(2)
+        );
+        assert_ne!(Some(Protocol::Udp(0)), addr.iter().nth(1));
+
+        let inbound = async move {
+            let (conn, _addr) = listener
+                .try_filter_map(|e| future::ready(Ok(e.into_upgrade())))
+                .try_next()
+                .await
+                .unwrap()
+                .unwrap();
+            conn.await
+        };
+
+        let outbound = transport
+            .dial(addr.with(Protocol::P2p(PeerId::random().into())))
+            .unwrap();
+
+        let (a, b) = futures::join!(inbound, outbound);
+        a.and(b).unwrap();
     }
 }
