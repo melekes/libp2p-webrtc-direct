@@ -20,13 +20,16 @@
 
 use futures::channel::oneshot;
 use futures::TryFutureExt;
-use log::{debug, error};
+use log::{debug, error, trace};
+use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
+use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::dtls_transport::dtls_role::DTLSRole;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc_data::data_channel::DataChannel as DetachedDataChannel;
 use webrtc_ice::udp_mux::UDPMux;
+use webrtc_ice::udp_network::UDPNetwork;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -34,7 +37,6 @@ use std::sync::Arc;
 use crate::connection::Connection;
 use crate::error::Error;
 use crate::sdp;
-use crate::transport::build_settings;
 
 pub struct WebRTCUpgrade {}
 
@@ -45,7 +47,18 @@ impl WebRTCUpgrade {
         // TODO: use socket_addr
         socket_addr: SocketAddr,
     ) -> Result<Connection<'static>, Error> {
-        let mut se = build_settings(udp_mux);
+        trace!("upgrading {}", socket_addr);
+
+        let mut se = SettingEngine::default();
+        // Disable remote's fingerprint verification.
+        se.disable_certificate_fingerprint_verification(true);
+        // Act as a lite ICE (ICE which does not send additional candidates).
+        se.set_lite(true);
+        // Set both ICE user and password to fingerprint.
+        // It will be checked by remote side when exchanging ICE messages.
+        // TODO: - set ufrag and pwd to fingerprint
+        se.set_ice_credentials("user".to_string(), "password".to_string());
+        se.set_udp_network(UDPNetwork::Muxed(udp_mux));
         // Act as a DTLS server (one which waits for a connection).
         se.set_answering_dtls_role(DTLSRole::Server)?;
 
@@ -53,7 +66,19 @@ impl WebRTCUpgrade {
         let peer_connection = api.new_peer_connection(config).await?;
 
         // Create a datachannel with label 'data'
-        let data_channel = peer_connection.create_data_channel("data", None).await?;
+        let data_channel = peer_connection
+            .create_data_channel(
+                "data",
+                Some(RTCDataChannelInit {
+                    negotiated: Some(true),
+                    id: Some(0),
+                    ordered: None,
+                    max_retransmits: None,
+                    max_packet_life_time: None,
+                    protocol: None,
+                }),
+            )
+            .await?;
 
         peer_connection
             .on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
@@ -69,7 +94,7 @@ impl WebRTCUpgrade {
         let d = Arc::clone(&data_channel);
         data_channel
             .on_open(Box::new(move || {
-                println!("Data channel '{}'-'{}' open.", d.label(), d.id());
+                debug!("Data channel '{}'-'{}' open.", d.label(), d.id());
 
                 let d2 = Arc::clone(&d);
                 Box::pin(async move {
@@ -88,7 +113,7 @@ impl WebRTCUpgrade {
         let mut offer = peer_connection.create_offer(None).await?;
         offer.sdp = sdp::CLIENT_SESSION_DESCRIPTION.to_string();
         // TODO: - set IN IP4 {REMOTE_IP}
-        //       - set ufrag and pwd to fingerprint
+        //       - set ufrag and pwd to remote's fingerprint
         debug!("REMOTE OFFER: {:?}", offer);
         peer_connection.set_remote_description(offer).await?;
 

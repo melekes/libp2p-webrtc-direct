@@ -128,6 +128,20 @@ impl WebRTCDirectTransport {
             new_addr_rx: Arc::new(Mutex::new(new_addr_rx)),
         })
     }
+
+    /// Returns the SHA-256 fingerprint of the certificate in lowercase hex string as expressed
+    /// utilizing the syntax of 'fingerprint' in <https://tools.ietf.org/html/rfc4572#section-5>.
+    fn cert_fingerprint(&self) -> String {
+        // safe to unwrap here because we require a certificate above
+        let fingerprints = self
+            .config
+            .certificates
+            .first()
+            .expect("at least one certificate")
+            .get_fingerprints()
+            .expect("fingerprints to succeed");
+        fingerprints.first().unwrap().value.to_owned()
+    }
 }
 
 impl Transport for WebRTCDirectTransport {
@@ -334,8 +348,13 @@ impl Stream for WebRTCListenStream {
 
 impl WebRTCDirectTransport {
     async fn do_dial(self, addr: Multiaddr) -> Result<Connection<'static>, Error> {
-        log::debug!("dialing {}", addr);
         let mut inner_addr = addr.clone();
+
+        let socket_addr = multiaddr_to_socketaddr(&inner_addr)
+            .ok_or_else(|| Error::InvalidMultiaddr(addr.clone()))?;
+        if socket_addr.port() == 0 || socket_addr.ip().is_unspecified() {
+            return Err(Error::InvalidMultiaddr(addr.clone()));
+        }
 
         let fingerprint = match inner_addr.pop() {
             Some(Protocol::XWebRTC(f)) => f,
@@ -345,44 +364,23 @@ impl WebRTCDirectTransport {
             },
         };
 
-        let socket_addr = multiaddr_to_socketaddr(&inner_addr)
-            .ok_or_else(|| Error::InvalidMultiaddr(addr.clone()))?;
-        if socket_addr.port() == 0 || socket_addr.ip().is_unspecified() {
-            return Err(Error::InvalidMultiaddr(addr.clone()));
-        }
-
-        let server_session_description = {
-            let mut tt = TinyTemplate::new();
-            tt.add_template("description", sdp::SERVER_SESSION_DESCRIPTION)
-                .unwrap();
-
-            let context = sdp::SessionDescriptionContext {
-                ip_version: {
-                    if socket_addr.is_ipv4() {
-                        sdp::IpVersion::IP4
-                    } else {
-                        sdp::IpVersion::IP6
-                    }
-                },
-                target_ip: socket_addr.ip(),
-                target_port: socket_addr.port(),
-                fingerprint: hex::encode(fingerprint.as_ref()),
-            };
-            // TODO: - set ufrag and pwd to fingerprint
-            tt.render("description", &context).unwrap()
-        };
-
         let config = self.config.clone();
 
         let remote = addr.clone(); // used for logging
 
         trace!("dialing address: {:?}", remote);
 
-        let mut se = build_settings(self.udp_mux.clone());
-
-        // Act as a DTLS client (one which initiates a connection).
-        se.set_answering_dtls_role(DTLSRole::Client)
-            .map_err(Error::WebRTC)?;
+        let mut se = SettingEngine::default();
+        {
+            // Set both ICE user and password to fingerprint.
+            // It will be checked by remote side when exchanging ICE messages.
+            let f = self.cert_fingerprint();
+            se.set_ice_credentials(f.clone(), f);
+            se.set_udp_network(UDPNetwork::Muxed(self.udp_mux.clone()));
+            // Act as a DTLS client (one which initiates a connection).
+            se.set_answering_dtls_role(DTLSRole::Client)
+                .map_err(Error::WebRTC)?;
+        }
 
         let api = APIBuilder::new().with_setting_engine(se).build();
 
@@ -408,7 +406,7 @@ impl WebRTCDirectTransport {
         let d = Arc::clone(&data_channel);
         data_channel
             .on_open(Box::new(move || {
-                println!("Data channel '{}'-'{}' open.", d.label(), d.id());
+                debug!("Data channel '{}'-'{}' open.", d.label(), d.id());
 
                 let d2 = Arc::clone(&d);
                 Box::pin(async move {
@@ -437,6 +435,28 @@ impl WebRTCDirectTransport {
             .create_answer(None)
             .map_err(Error::WebRTC)
             .await?;
+        let server_session_description = {
+            let mut tt = TinyTemplate::new();
+            tt.add_template("description", sdp::SERVER_SESSION_DESCRIPTION)
+                .unwrap();
+
+            let f = fingerprint_to_hex_string(&fingerprint);
+            let context = sdp::SessionDescriptionContext {
+                ip_version: {
+                    if socket_addr.is_ipv4() {
+                        sdp::IpVersion::IP4
+                    } else {
+                        sdp::IpVersion::IP6
+                    }
+                },
+                target_ip: socket_addr.ip(),
+                target_port: socket_addr.port(),
+                fingerprint: hex::encode(fingerprint.as_ref()),
+                ufrag: f.clone(),
+                pwd: f,
+            };
+            tt.render("description", &context).unwrap()
+        };
         // Set the local description and start UDP listeners
         // Note: this will start the gathering of ICE candidates
         answer.sdp = server_session_description;
@@ -497,22 +517,8 @@ fn socketaddr_to_multiaddr<'a>(
         .with(Protocol::XWebRTC(fingerprint))
 }
 
-pub fn build_settings(udp_mux: Arc<dyn UDPMux + Send + Sync>) -> SettingEngine {
-    let mut se = SettingEngine::default();
-
-    // Disable remote's fingerprint verification.
-    se.disable_certificate_fingerprint_verification(true);
-
-    // Act as a lite ICE (ICE which does not send additional candidates).
-    se.set_lite(true);
-
-    // Set both ICE user and password to fingerprint.
-    // It will be checked by remote side when exchanging ICE messages.
-    se.set_ice_credentials("user".to_string(), "password".to_string());
-
-    se.set_udp_network(UDPNetwork::Muxed(udp_mux));
-
-    se
+fn fingerprint_to_hex_string(f: &Cow<'_, [u8; 32]>) -> String {
+    hex::encode(f.as_ref()).to_uppercase()
 }
 
 // Tests //////////////////////////////////////////////////////////////////////////////////////////
@@ -618,27 +624,29 @@ mod tests {
 
     #[tokio::test]
     async fn dialer_connects_to_listener_ipv4() {
-        let a = "/ip4/127.0.0.1/udp/0/x-webrtc/ACD1E533EC271FCDE0275947F4D62A2B2331FF10C9DDE0298EB7B399B4BFF60B".parse().unwrap();
+        let _ = env_logger::builder().is_test(true).try_init();
+        let a = "127.0.0.1:0".parse().unwrap();
         connect(a).await
     }
 
     #[tokio::test]
     async fn dialer_connects_to_listener_ipv6() {
-        let a = "/ip6/::1/udp/0/x-webrtc/ACD1E533EC271FCDE0275947F4D62A2B2331FF10C9DDE0298EB7B399B4BFF60B".parse().unwrap();
+        let _ = env_logger::builder().is_test(true).try_init();
+        let a = "[::1]:0".parse().unwrap();
         connect(a).await;
     }
 
-    async fn connect(listen_addr: Multiaddr) {
+    async fn connect(listen_addr: SocketAddr) {
         let kp = KeyPair::generate(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key pair");
         let cert = RTCCertificate::from_key_pair(kp).expect("certificate");
-        let transport = WebRTCDirectTransport::new(
-            cert,
-            multiaddr_to_socketaddr(&listen_addr).expect("socket addr"),
-        )
-        .await
-        .expect("transport");
+        let transport = WebRTCDirectTransport::new(cert, listen_addr)
+            .await
+            .expect("transport");
 
-        let mut listener = transport.clone().listen_on(listen_addr).expect("listener");
+        let mut listener = transport
+            .clone()
+            .listen_on(ip_to_multiaddr(listen_addr.ip(), listen_addr.port()))
+            .expect("listener");
 
         let addr = listener
             .try_next()

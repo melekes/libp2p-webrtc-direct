@@ -149,22 +149,22 @@ a=max-message-size:100000
 ///
 ///     A transport address for a candidate that can be used for connectivity checks (RFC8839).
 pub const SERVER_SESSION_DESCRIPTION: &'static str = "v=0
-o=- 0 0 IN IP {IP_VERSION} {TARGET_IP}
+o=- 0 0 IN IP {ip_version} {target_ip}
 s=-
 t=0 0
 a=ice-lite
-m=application {TARGET_PORT} UDP/DTLS/SCTP webrtc-datachannel
-c=IN IP {IP_VERSION} {TARGET_IP}
+m=application {target_port} UDP/DTLS/SCTP webrtc-datachannel
+c=IN IP {ip_version} {target_ip}
 a=mid:0
 a=ice-options:ice2
-a=ice-ufrag:user
-a=ice-pwd:password
-a=fingerprint:sha-256 {FINGERPRINT}
+a=ice-ufrag:{ufrag}
+a=ice-pwd:{pwd}
+a=fingerprint:sha-256 {fingerprint}
 
 a=setup:passive
 a=sctp-port:5000
 a=max-message-size:100000
-a=candidate:1 1 UDP 2113667327 {TARGET_IP} {TARGET_PORT} typ host
+a=candidate:1 1 UDP 2113667327 {target_ip} {target_port} typ host
 ";
 
 /// Indicates the IP version used in WebRTC: `IP4` or `IP6`.
@@ -182,4 +182,6 @@ pub struct SessionDescriptionContext {
     pub target_ip: IpAddr,
     pub target_port: u16,
     pub fingerprint: String,
+    pub ufrag: String,
+    pub pwd: String,
 }

@@ -73,6 +73,8 @@ impl UDPMuxParams {
     }
 }
 
+/// This is a copy of `UDPMuxDefault` with the exception of ability to report new addresses via
+/// `new_addr_tx`.
 pub struct UDPMuxNewAddr {
     /// The params this instance is configured with.
     /// Contains the underlying UDP socket in use
@@ -92,7 +94,7 @@ pub struct UDPMuxNewAddr {
 }
 
 impl UDPMuxNewAddr {
-    pub fn new(params: UDPMuxParams, mut new_addr_tx: mpsc::Sender<SocketAddr>) -> Arc<Self> {
+    pub fn new(params: UDPMuxParams, new_addr_tx: mpsc::Sender<SocketAddr>) -> Arc<Self> {
         let (closed_watch_tx, closed_watch_rx) = watch::channel(());
 
         let mux = Arc::new(Self {
