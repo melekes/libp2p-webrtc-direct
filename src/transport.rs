@@ -46,6 +46,7 @@ use webrtc::dtls_transport::dtls_role::DTLSRole;
 use webrtc::peer_connection::certificate::RTCCertificate;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc_data::data_channel::DataChannel as DetachedDataChannel;
 use webrtc_ice::udp_mux::UDPMux;
 use webrtc_ice::udp_network::UDPNetwork;
@@ -431,10 +432,6 @@ impl WebRTCDirectTransport {
             .map_err(Error::WebRTC)
             .await?;
 
-        let mut answer = peer_connection
-            .create_answer(None)
-            .map_err(Error::WebRTC)
-            .await?;
         let server_session_description = {
             let mut tt = TinyTemplate::new();
             tt.add_template("description", sdp::SERVER_SESSION_DESCRIPTION)
@@ -457,14 +454,19 @@ impl WebRTCDirectTransport {
             };
             tt.render("description", &context).unwrap()
         };
+        let sdp = RTCSessionDescription::answer(server_session_description.clone()).unwrap();
         // Set the local description and start UDP listeners
         // Note: this will start the gathering of ICE candidates
-        answer.sdp = server_session_description;
-        debug!("REMOTE ANSWER: {:?}", answer);
         peer_connection
-            .set_remote_description(answer)
+            .set_remote_description(sdp)
             .map_err(Error::WebRTC)
             .await?;
+        let mut answer = peer_connection
+            .create_answer(None)
+            .map_err(Error::WebRTC)
+            .await?;
+        answer.sdp = server_session_description;
+        debug!("REMOTE ANSWER: {:?}", answer);
 
         // wait until data channel is opened and ready to use
         let data_channel = data_channel_tx

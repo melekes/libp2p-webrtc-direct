@@ -149,12 +149,12 @@ a=max-message-size:100000
 ///
 ///     A transport address for a candidate that can be used for connectivity checks (RFC8839).
 pub const SERVER_SESSION_DESCRIPTION: &'static str = "v=0
-o=- 0 0 IN IP {ip_version} {target_ip}
+o=- 0 0 IN {ip_version} {target_ip}
 s=-
 t=0 0
 a=ice-lite
 m=application {target_port} UDP/DTLS/SCTP webrtc-datachannel
-c=IN IP {ip_version} {target_ip}
+c=IN {ip_version} {target_ip}
 a=mid:0
 a=ice-options:ice2
 a=ice-ufrag:{ufrag}
