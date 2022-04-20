@@ -448,25 +448,20 @@ impl WebRTCDirectTransport {
                 },
                 target_ip: socket_addr.ip(),
                 target_port: socket_addr.port(),
-                fingerprint: hex::encode(fingerprint.as_ref()),
+                fingerprint: format_fingerprint(&fingerprint),
                 ufrag: f.clone(),
                 pwd: f,
             };
             tt.render("description", &context).unwrap()
         };
         let sdp = RTCSessionDescription::answer(server_session_description.clone()).unwrap();
+        debug!("REMOTE ANSWER: {:?}", sdp);
         // Set the local description and start UDP listeners
         // Note: this will start the gathering of ICE candidates
         peer_connection
             .set_remote_description(sdp)
             .map_err(Error::WebRTC)
             .await?;
-        let mut answer = peer_connection
-            .create_answer(None)
-            .map_err(Error::WebRTC)
-            .await?;
-        answer.sdp = server_session_description;
-        debug!("REMOTE ANSWER: {:?}", answer);
 
         // wait until data channel is opened and ready to use
         let data_channel = data_channel_tx
@@ -521,6 +516,11 @@ fn socketaddr_to_multiaddr<'a>(
 
 fn fingerprint_to_hex_string(f: &Cow<'_, [u8; 32]>) -> String {
     hex::encode(f.as_ref()).to_uppercase()
+}
+
+fn format_fingerprint(f: &Cow<'_, [u8; 32]>) -> String {
+    let values: Vec<String> = f.iter().map(|x| format! {"{:02x}", x}).collect();
+    values.join(":")
 }
 
 // Tests //////////////////////////////////////////////////////////////////////////////////////////
