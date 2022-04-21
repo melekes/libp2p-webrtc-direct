@@ -19,7 +19,10 @@
 // DEALINGS IN THE SOFTWARE.
 
 use futures::channel::oneshot;
+use libp2p_core::multiaddr::{Multiaddr, Protocol};
 use log::{debug, error, trace};
+use std::sync::Arc;
+use std::time::Duration;
 use tinytemplate::TinyTemplate;
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
@@ -31,13 +34,10 @@ use webrtc_data::data_channel::DataChannel as DetachedDataChannel;
 use webrtc_ice::udp_mux::UDPMux;
 use webrtc_ice::udp_network::UDPNetwork;
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
-
 use crate::connection::Connection;
 use crate::error::Error;
 use crate::sdp;
+use crate::transport;
 
 pub struct WebRTCUpgrade {}
 
@@ -45,25 +45,19 @@ impl WebRTCUpgrade {
     pub async fn new(
         udp_mux: Arc<dyn UDPMux + Send + Sync>,
         config: RTCConfiguration,
-        socket_addr: SocketAddr,
+        addr: Multiaddr,
     ) -> Result<Connection<'static>, Error> {
-        trace!("upgrading {}", socket_addr);
+        trace!("upgrading {}", addr);
 
         let mut se = SettingEngine::default();
         // Disable remote's fingerprint verification.
-        se.disable_certificate_fingerprint_verification(true);
+        // se.disable_certificate_fingerprint_verification(true);
         // Act as a lite ICE (ICE which does not send additional candidates).
         se.set_lite(true);
         // Set both ICE user and password to fingerprint.
         // It will be checked by remote side when exchanging ICE messages.
-        let fingerprints = config
-            .certificates
-            .first()
-            .expect("at least one certificate")
-            .get_fingerprints()
-            .expect("fingerprints to succeed");
-        let f = fingerprints.first().unwrap().value.to_owned();
-        se.set_ice_credentials(f.clone(), f);
+        let f = fingerprint_of_first_certificate(&config);
+        se.set_ice_credentials(f.clone().replace(":", ""), f.replace(":", ""));
         se.set_udp_network(UDPNetwork::Muxed(udp_mux));
 
         let api = APIBuilder::new().with_setting_engine(se).build();
@@ -113,15 +107,23 @@ impl WebRTCUpgrade {
             }))
             .await;
 
+        let socket_addr = transport::multiaddr_to_socketaddr(&addr)
+            .ok_or_else(|| Error::InvalidMultiaddr(addr.clone()))?;
+
         // Set the remote description to the predefined SDP
-        let clint_session_description = {
+        let client_session_description = {
             let mut tt = TinyTemplate::new();
             tt.add_template("description", sdp::CLIENT_SESSION_DESCRIPTION)
                 .unwrap();
 
-            // TODO: get fingerptint from STUN packet?
-            let f = "TODO".to_string();
-            // let f = format_fingerprint(&fingerprint);
+            let fingerprint = match addr.iter().last() {
+                Some(Protocol::XWebRTC(f)) => f,
+                _ => {
+                    debug!("{} is not a WebRTC multiaddr", addr);
+                    return Err(Error::InvalidMultiaddr(addr));
+                },
+            };
+            let f = transport::format_fingerprint(&fingerprint);
             let context = sdp::DescriptionContext {
                 ip_version: if socket_addr.is_ipv4() {
                     sdp::IpVersion::IP4
@@ -131,19 +133,19 @@ impl WebRTCUpgrade {
                 target_ip: socket_addr.ip(),
                 target_port: socket_addr.port(),
                 fingerprint: f.clone(),
-                ufrag: f.clone(),
-                pwd: f,
+                ufrag: f.clone().replace(":", ""),
+                pwd: f.replace(":", ""),
             };
             tt.render("description", &context).unwrap()
         };
-        let sdp = RTCSessionDescription::offer(clint_session_description.clone()).unwrap();
-        debug!("REMOTE OFFER: {:?}", sdp);
+        let sdp = RTCSessionDescription::offer(client_session_description.clone()).unwrap();
+        debug!("OFFER: {:?}", sdp);
         peer_connection.set_remote_description(sdp).await?;
 
         let answer = peer_connection.create_answer(None).await?;
         // Set the local description and start UDP listeners
         // Note: this will start the gathering of ICE candidates
-        debug!("LOCAL ANSWER: {:?}", answer);
+        debug!("ANSWER: {:?}", answer);
         peer_connection.set_local_description(answer).await?;
 
         // wait until data channel is opened and ready to use
@@ -154,4 +156,14 @@ impl WebRTCUpgrade {
             )),
         }
     }
+}
+
+fn fingerprint_of_first_certificate(config: &RTCConfiguration) -> String {
+    let fingerprints = config
+        .certificates
+        .first()
+        .expect("at least one certificate")
+        .get_fingerprints()
+        .expect("fingerprints to succeed");
+    fingerprints.first().unwrap().value.to_owned()
 }

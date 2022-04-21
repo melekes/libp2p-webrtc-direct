@@ -21,6 +21,7 @@
 // SOFTWARE.
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     io::ErrorKind,
     net::SocketAddr,
@@ -28,6 +29,7 @@ use std::{
 };
 
 use futures::channel::mpsc;
+use libp2p_core::multiaddr::{Multiaddr, Protocol};
 use webrtc_ice::udp_mux::UDPMux;
 use webrtc_util::{sync::RwLock, Conn, Error};
 
@@ -103,7 +105,7 @@ pub struct UDPMuxNewAddr {
 }
 
 impl UDPMuxNewAddr {
-    pub fn new(params: UDPMuxParams, new_addr_tx: mpsc::Sender<SocketAddr>) -> Arc<Self> {
+    pub fn new(params: UDPMuxParams, new_addr_tx: mpsc::Sender<Multiaddr>) -> Arc<Self> {
         let (closed_watch_tx, closed_watch_rx) = watch::channel(());
 
         let mux = Arc::new(Self {
@@ -176,45 +178,14 @@ impl UDPMuxNewAddr {
     }
 
     async fn conn_from_stun_message(&self, buffer: &[u8], addr: &SocketAddr) -> Option<UDPMuxConn> {
-        let (result, message) = {
-            let mut m = STUNMessage::new();
-
-            (m.unmarshal_binary(buffer), m)
-        };
-
-        match result {
-            Err(err) => {
-                log::warn!("Failed to handle decode ICE from {}: {}", addr, err);
-                None
-            },
-            Ok(_) => {
-                let (attr, found) = message.attributes.get(ATTR_USERNAME);
-                if !found {
-                    log::warn!("No username attribute in STUN message from {}", &addr);
-                    return None;
-                }
-
-                let s = match String::from_utf8(attr.value) {
-                    // Per the RFC this shouldn't happen
-                    // https://datatracker.ietf.org/doc/html/rfc5389#section-15.3
-                    Err(err) => {
-                        log::warn!(
-                            "Failed to decode USERNAME from STUN message as UTF-8: {}",
-                            err
-                        );
-                        return None;
-                    },
-                    Ok(s) => s,
-                };
-
+        match ufrag_from_stun_message(buffer, true) {
+            Ok(ufrag) => {
                 let conns = self.conns.lock().await;
-                let conn = s
-                    .split(':')
-                    .next()
-                    .and_then(|ufrag| conns.get(ufrag))
-                    .map(Clone::clone);
-
-                conn
+                conns.get(&ufrag).map(Clone::clone)
+            },
+            Err(e) => {
+                log::error!("{} (addr: {})", e, addr);
+                None
             },
         }
     }
@@ -222,7 +193,7 @@ impl UDPMuxNewAddr {
     fn start_conn_worker(
         self: Arc<Self>,
         mut closed_watch_rx: watch::Receiver<()>,
-        mut new_addr_tx: mpsc::Sender<SocketAddr>,
+        mut new_addr_tx: mpsc::Sender<Multiaddr>,
     ) {
         tokio::spawn(async move {
             let mut buffer = [0u8; RECEIVE_MTU];
@@ -257,12 +228,23 @@ impl UDPMuxNewAddr {
                                 match conn {
                                     None => {
                                         if !loop_self.new_addrs.read().contains(&addr) {
-                                            log::trace!("Notifying about new address {}", &addr);
-                                            if let Err(err) = new_addr_tx.try_send(addr) {
-                                                log::error!("Failed to send new address {}: {}", &addr, err);
-                                            } else {
-                                                let mut new_addrs = loop_self.new_addrs.write();
-                                                new_addrs.insert(addr.clone());
+                                            match ufrag_from_stun_message(&buffer, false) {
+                                                Ok(ufrag) => {
+                                                    log::trace!("Notifying about new address {} from {}", &addr, ufrag);
+                                                    let a = Multiaddr::empty()
+                                                        .with(addr.ip().into())
+                                                        .with(Protocol::Udp(addr.port()))
+                                                        .with(Protocol::XWebRTC(hex_to_cow(&ufrag.replace(":", ""))));
+                                                    if let Err(err) = new_addr_tx.try_send(a) {
+                                                        log::error!("Failed to send new address {}: {}", &addr, err);
+                                                    } else {
+                                                        let mut new_addrs = loop_self.new_addrs.write();
+                                                        new_addrs.insert(addr.clone());
+                                                    };
+                                                }
+                                                Err(e) => {
+                                                    log::trace!("Unknown address {} (non STUN packet: {})", &addr, e);
+                                                }
                                             }
                                         }
                                     }
@@ -379,5 +361,52 @@ impl UDPMux for UDPMuxNewAddr {
                 address_map.remove(&address);
             }
         }
+    }
+}
+
+fn hex_to_cow<'a>(s: &str) -> Cow<'a, [u8; 32]> {
+    let mut buf = [0; 32];
+    hex::decode_to_slice(s, &mut buf).unwrap();
+    Cow::Owned(buf)
+}
+
+fn ufrag_from_stun_message(buffer: &[u8], first: bool) -> Result<String, Error> {
+    let (result, message) = {
+        let mut m = STUNMessage::new();
+
+        (m.unmarshal_binary(buffer), m)
+    };
+
+    match result {
+        Err(err) => Err(Error::Other(format!(
+            "failed to handle decode ICE: {}",
+            err
+        ))),
+        Ok(_) => {
+            let (attr, found) = message.attributes.get(ATTR_USERNAME);
+            if !found {
+                return Err(Error::Other("no username attribute in STUN message".into()));
+            }
+
+            match String::from_utf8(attr.value) {
+                // Per the RFC this shouldn't happen
+                // https://datatracker.ietf.org/doc/html/rfc5389#section-15.3
+                Err(err) => Err(Error::Other(format!(
+                    "failed to decode USERNAME from STUN message as UTF-8: {}",
+                    err
+                ))),
+                Ok(s) => {
+                    let res = if first {
+                        s.split(":").next()
+                    } else {
+                        s.split(":").last()
+                    };
+                    match res {
+                        Some(s) => Ok(s.to_owned()),
+                        None => Err(Error::Other("can't get ufrag from username".into())),
+                    }
+                },
+            }
+        },
     }
 }

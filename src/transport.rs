@@ -95,7 +95,7 @@ pub struct WebRTCDirectTransport {
     udp_mux_addr: SocketAddr,
 
     /// The receiver for new `SocketAddr` connecting to this peer.
-    new_addr_rx: Arc<Mutex<mpsc::Receiver<SocketAddr>>>,
+    new_addr_rx: Arc<Mutex<mpsc::Receiver<Multiaddr>>>,
 }
 
 impl WebRTCDirectTransport {
@@ -197,7 +197,7 @@ pub struct WebRTCListenStream {
     /// The `UDPMux` that manages all ICE connections.
     udp_mux: Arc<dyn UDPMux + Send + Sync>,
     /// The receiver for new `SocketAddr` connecting to this peer.
-    new_addr_rx: Arc<Mutex<mpsc::Receiver<SocketAddr>>>,
+    new_addr_rx: Arc<Mutex<mpsc::Receiver<Multiaddr>>>,
 }
 
 impl WebRTCListenStream {
@@ -207,7 +207,7 @@ impl WebRTCListenStream {
         listen_addr: SocketAddr,
         config: RTCConfiguration,
         udp_mux: Arc<dyn UDPMux + Send + Sync>,
-        new_addr_rx: Arc<Mutex<mpsc::Receiver<SocketAddr>>>,
+        new_addr_rx: Arc<Mutex<mpsc::Receiver<Multiaddr>>>,
     ) -> Self {
         // Check whether the listening IP is set or not.
         let in_addr = if match &listen_addr {
@@ -327,13 +327,13 @@ impl Stream for WebRTCListenStream {
             }
 
             return match Pin::new(&mut *me.new_addr_rx.lock().unwrap()).poll_next(cx) {
-                Poll::Ready(Some(socket_addr)) => Poll::Ready(Some(Ok(ListenerEvent::Upgrade {
+                Poll::Ready(Some(addr)) => Poll::Ready(Some(Ok(ListenerEvent::Upgrade {
                     local_addr: ip_to_multiaddr(me.listen_addr.ip(), me.listen_addr.port()),
-                    remote_addr: ip_to_multiaddr(socket_addr.ip(), socket_addr.port()),
+                    remote_addr: addr.clone(),
                     upgrade: Box::pin(WebRTCUpgrade::new(
                         me.udp_mux.clone(),
                         me.config.clone(),
-                        socket_addr,
+                        addr,
                     )) as BoxFuture<'static, _>,
                 }))),
                 Poll::Ready(None) => Poll::Ready(None),
@@ -345,15 +345,13 @@ impl Stream for WebRTCListenStream {
 
 impl WebRTCDirectTransport {
     async fn do_dial(self, addr: Multiaddr) -> Result<Connection<'static>, Error> {
-        let mut inner_addr = addr.clone();
-
-        let socket_addr = multiaddr_to_socketaddr(&inner_addr)
-            .ok_or_else(|| Error::InvalidMultiaddr(addr.clone()))?;
+        let socket_addr =
+            multiaddr_to_socketaddr(&addr).ok_or_else(|| Error::InvalidMultiaddr(addr.clone()))?;
         if socket_addr.port() == 0 || socket_addr.ip().is_unspecified() {
             return Err(Error::InvalidMultiaddr(addr.clone()));
         }
 
-        let fingerprint = match inner_addr.pop() {
+        let fingerprint = match addr.iter().last() {
             Some(Protocol::XWebRTC(f)) => f,
             _ => {
                 debug!("{} is not a WebRTC multiaddr", addr);
@@ -372,7 +370,7 @@ impl WebRTCDirectTransport {
             // Set both ICE user and password to fingerprint.
             // It will be checked by remote side when exchanging ICE messages.
             let f = self.cert_fingerprint();
-            se.set_ice_credentials(f.clone(), f);
+            se.set_ice_credentials(f.clone().replace(":", ""), f.replace(":", ""));
             se.set_udp_network(UDPNetwork::Muxed(self.udp_mux.clone()));
         }
 
@@ -419,7 +417,7 @@ impl WebRTCDirectTransport {
             .create_offer(None)
             .map_err(Error::WebRTC)
             .await?;
-        debug!("LOCAL OFFER: {:?}", offer);
+        debug!("OFFER: {:?}", offer);
         peer_connection
             .set_local_description(offer)
             .map_err(Error::WebRTC)
@@ -442,13 +440,13 @@ impl WebRTCDirectTransport {
                 target_ip: socket_addr.ip(),
                 target_port: socket_addr.port(),
                 fingerprint: f.clone(),
-                ufrag: f.clone(),
-                pwd: f,
+                ufrag: f.clone().replace(":", ""),
+                pwd: f.replace(":", ""),
             };
             tt.render("description", &context).unwrap()
         };
         let sdp = RTCSessionDescription::answer(server_session_description.clone()).unwrap();
-        debug!("REMOTE ANSWER: {:?}", sdp);
+        debug!("ANSWER: {:?}", sdp);
         // Set the local description and start UDP listeners
         // Note: this will start the gathering of ICE candidates
         peer_connection
@@ -473,7 +471,7 @@ fn ip_to_multiaddr(ip: IpAddr, port: u16) -> Multiaddr {
 
 /// Tries to turn a WebRTC multiaddress into a [`SocketAddr`]. Returns None if the format of the
 /// multiaddr is wrong.
-fn multiaddr_to_socketaddr(addr: &Multiaddr) -> Option<SocketAddr> {
+pub(crate) fn multiaddr_to_socketaddr(addr: &Multiaddr) -> Option<SocketAddr> {
     let mut iter = addr.iter();
     let proto1 = iter.next()?;
     let proto2 = iter.next()?;
@@ -508,7 +506,7 @@ fn multiaddr_to_socketaddr(addr: &Multiaddr) -> Option<SocketAddr> {
 //         .with(Protocol::XWebRTC(fingerprint))
 // }
 
-fn format_fingerprint(f: &Cow<'_, [u8; 32]>) -> String {
+pub(crate) fn format_fingerprint(f: &Cow<'_, [u8; 32]>) -> String {
     let values: Vec<String> = f.iter().map(|x| format! {"{:02x}", x}).collect();
     values.join(":")
 }
