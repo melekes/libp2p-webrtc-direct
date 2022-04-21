@@ -45,7 +45,6 @@ impl WebRTCUpgrade {
     pub async fn new(
         udp_mux: Arc<dyn UDPMux + Send + Sync>,
         config: RTCConfiguration,
-        // TODO: use socket_addr
         socket_addr: SocketAddr,
     ) -> Result<Connection<'static>, Error> {
         trace!("upgrading {}", socket_addr);

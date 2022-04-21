@@ -198,9 +198,6 @@ pub struct WebRTCListenStream {
     udp_mux: Arc<dyn UDPMux + Send + Sync>,
     /// The receiver for new `SocketAddr` connecting to this peer.
     new_addr_rx: Arc<Mutex<mpsc::Receiver<SocketAddr>>>,
-    // TODO: track addresses we've already seen and do not upgrade them
-    // We need this because new addr might arrive while upgrade is in process for the same address.
-    // seen_addrs: HashSet<SocketAddr>,
 }
 
 impl WebRTCListenStream {

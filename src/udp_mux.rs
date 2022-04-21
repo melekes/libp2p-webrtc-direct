@@ -20,7 +20,12 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-use std::{collections::HashMap, io::ErrorKind, net::SocketAddr, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    io::ErrorKind,
+    net::SocketAddr,
+    sync::Arc,
+};
 
 use futures::channel::mpsc;
 use webrtc_ice::udp_mux::UDPMux;
@@ -91,6 +96,10 @@ pub struct UDPMuxNewAddr {
 
     /// Close reciever
     closed_watch_rx: watch::Receiver<()>,
+
+    /// Set of the new IP addresses reported via `new_addr_tx` to avoid sending the same IP
+    /// multiple times.
+    new_addrs: RwLock<HashSet<SocketAddr>>,
 }
 
 impl UDPMuxNewAddr {
@@ -103,6 +112,7 @@ impl UDPMuxNewAddr {
             address_map: RwLock::default(),
             closed_watch_tx: Mutex::new(Some(closed_watch_tx)),
             closed_watch_rx: closed_watch_rx.clone(),
+            new_addrs: RwLock::default(),
         });
 
         let cloned_mux = Arc::clone(&mux);
@@ -154,6 +164,12 @@ impl UDPMuxNewAddr {
                     }
                 })
                 .or_insert_with(|| conn.clone());
+        }
+
+        // remove addr from new_addrs once conn is established
+        {
+            let mut new_addrs = self.new_addrs.write();
+            new_addrs.remove(&addr);
         }
 
         log::debug!("Registered {} for {}", addr, key);
@@ -240,9 +256,14 @@ impl UDPMuxNewAddr {
 
                                 match conn {
                                     None => {
-                                        log::trace!("Notifying about new address {}", &addr);
-                                        if let Err(err) = new_addr_tx.try_send(addr) {
-                                            log::error!("Failed to send new address {}: {}", &addr, err);
+                                        if !loop_self.new_addrs.read().contains(&addr) {
+                                            log::trace!("Notifying about new address {}", &addr);
+                                            if let Err(err) = new_addr_tx.try_send(addr) {
+                                                log::error!("Failed to send new address {}: {}", &addr, err);
+                                            } else {
+                                                let mut new_addrs = loop_self.new_addrs.write();
+                                                new_addrs.insert(addr.clone());
+                                            }
                                         }
                                     }
                                     Some(conn) => {
@@ -298,6 +319,14 @@ impl UDPMux for UDPMuxNewAddr {
                 // NOTE: This is important, we need to drop all instances of `UDPMuxConn` to
                 // avoid a retain cycle due to the use of [`std::sync::Arc`] on both sides.
                 let _ = std::mem::take(&mut (*address_map));
+            }
+
+            {
+                let mut new_addrs = self.new_addrs.write();
+
+                // NOTE: This is important, we need to drop all instances of `UDPMuxConn` to
+                // avoid a retain cycle due to the use of [`std::sync::Arc`] on both sides.
+                let _ = std::mem::take(&mut (*new_addrs));
             }
         }
 
