@@ -19,20 +19,21 @@
 // DEALINGS IN THE SOFTWARE.
 
 use futures::channel::oneshot;
-use futures::TryFutureExt;
 use log::{debug, error, trace};
+use tinytemplate::TinyTemplate;
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
-use webrtc::dtls_transport::dtls_role::DTLSRole;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
+use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc_data::data_channel::DataChannel as DetachedDataChannel;
 use webrtc_ice::udp_mux::UDPMux;
 use webrtc_ice::udp_network::UDPNetwork;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::connection::Connection;
 use crate::error::Error;
@@ -56,11 +57,15 @@ impl WebRTCUpgrade {
         se.set_lite(true);
         // Set both ICE user and password to fingerprint.
         // It will be checked by remote side when exchanging ICE messages.
-        // TODO: - set ufrag and pwd to fingerprint
-        se.set_ice_credentials("user".to_string(), "password".to_string());
+        let fingerprints = config
+            .certificates
+            .first()
+            .expect("at least one certificate")
+            .get_fingerprints()
+            .expect("fingerprints to succeed");
+        let f = fingerprints.first().unwrap().value.to_owned();
+        se.set_ice_credentials(f.clone(), f);
         se.set_udp_network(UDPNetwork::Muxed(udp_mux));
-        // Act as a DTLS server (one which waits for a connection).
-        se.set_answering_dtls_role(DTLSRole::Server)?;
 
         let api = APIBuilder::new().with_setting_engine(se).build();
         let peer_connection = api.new_peer_connection(config).await?;
@@ -110,12 +115,31 @@ impl WebRTCUpgrade {
             .await;
 
         // Set the remote description to the predefined SDP
-        let mut offer = peer_connection.create_offer(None).await?;
-        offer.sdp = sdp::CLIENT_SESSION_DESCRIPTION.to_string();
-        // TODO: - set IN IP4 {REMOTE_IP}
-        //       - set ufrag and pwd to remote's fingerprint
-        debug!("REMOTE OFFER: {:?}", offer);
-        peer_connection.set_remote_description(offer).await?;
+        let clint_session_description = {
+            let mut tt = TinyTemplate::new();
+            tt.add_template("description", sdp::CLIENT_SESSION_DESCRIPTION)
+                .unwrap();
+
+            // TODO: get fingerptint from STUN packet?
+            let f = "TODO".to_string();
+            // let f = format_fingerprint(&fingerprint);
+            let context = sdp::DescriptionContext {
+                ip_version: if socket_addr.is_ipv4() {
+                    sdp::IpVersion::IP4
+                } else {
+                    sdp::IpVersion::IP6
+                },
+                target_ip: socket_addr.ip(),
+                target_port: socket_addr.port(),
+                fingerprint: f.clone(),
+                ufrag: f.clone(),
+                pwd: f,
+            };
+            tt.render("description", &context).unwrap()
+        };
+        let sdp = RTCSessionDescription::offer(clint_session_description.clone()).unwrap();
+        debug!("REMOTE OFFER: {:?}", sdp);
+        peer_connection.set_remote_description(sdp).await?;
 
         let answer = peer_connection.create_answer(None).await?;
         // Set the local description and start UDP listeners
@@ -124,10 +148,11 @@ impl WebRTCUpgrade {
         peer_connection.set_local_description(answer).await?;
 
         // wait until data channel is opened and ready to use
-        let data_channel = data_channel_tx
-            .map_err(|e| Error::InternalError(e.to_string()))
-            .await?;
-
-        Ok(Connection::new(peer_connection, data_channel))
+        match tokio_crate::time::timeout(Duration::from_secs(10), data_channel_tx).await {
+            Ok(Ok(dc)) => Ok(Connection::new(peer_connection, dc)),
+            Err(_) | Ok(Err(_)) => Err(Error::InternalError(
+                "data channel opening took longer than 10 seconds".into(),
+            )),
+        }
     }
 }

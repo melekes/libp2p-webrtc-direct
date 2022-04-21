@@ -96,17 +96,17 @@ use std::net::IpAddr;
 ///
 ///     The maximum SCTP user message size (in bytes). (RFC8841)
 pub const CLIENT_SESSION_DESCRIPTION: &'static str = "v=0
-o=- 0 0 IN IP4 0.0.0.0
+o=- 0 0 IN {ip_version} {target_ip}
 s=-
-c=IN IP4 0.0.0.0
+c=IN {ip_version} {target_ip}
 t=0 0
 
-m=application 9 UDP/DTLS/SCTP webrtc-datachannel
+m=application {target_port} UDP/DTLS/SCTP webrtc-datachannel
 a=mid:0
 a=ice-options:ice2
-a=ice-ufrag:user
-a=ice-pwd:password
-a=fingerprint:sha-256 invalidFingerprint
+a=ice-ufrag:{ufrag}
+a=ice-pwd:{pwd}
+a=fingerprint:sha-256 {fingerprint}
 a=setup:actpass
 a=sctp-port:5000
 a=max-message-size:100000
@@ -177,7 +177,7 @@ pub enum IpVersion {
 /// Context passed to the templating engine, which replaces the above placeholders (e.g.
 /// `{IP_VERSION}`) with real values.
 #[derive(Serialize)]
-pub struct SessionDescriptionContext {
+pub struct DescriptionContext {
     pub ip_version: IpVersion,
     pub target_ip: IpAddr,
     pub target_port: u16,

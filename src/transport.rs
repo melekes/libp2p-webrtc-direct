@@ -42,7 +42,6 @@ use log::{debug, error, trace};
 use tinytemplate::TinyTemplate;
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
-use webrtc::dtls_transport::dtls_role::DTLSRole;
 use webrtc::peer_connection::certificate::RTCCertificate;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
@@ -378,9 +377,6 @@ impl WebRTCDirectTransport {
             let f = self.cert_fingerprint();
             se.set_ice_credentials(f.clone(), f);
             se.set_udp_network(UDPNetwork::Muxed(self.udp_mux.clone()));
-            // Act as a DTLS client (one which initiates a connection).
-            se.set_answering_dtls_role(DTLSRole::Client)
-                .map_err(Error::WebRTC)?;
         }
 
         let api = APIBuilder::new().with_setting_engine(se).build();
@@ -437,8 +433,8 @@ impl WebRTCDirectTransport {
             tt.add_template("description", sdp::SERVER_SESSION_DESCRIPTION)
                 .unwrap();
 
-            let f = fingerprint_to_hex_string(&fingerprint);
-            let context = sdp::SessionDescriptionContext {
+            let f = format_fingerprint(&fingerprint);
+            let context = sdp::DescriptionContext {
                 ip_version: {
                     if socket_addr.is_ipv4() {
                         sdp::IpVersion::IP4
@@ -448,7 +444,7 @@ impl WebRTCDirectTransport {
                 },
                 target_ip: socket_addr.ip(),
                 target_port: socket_addr.port(),
-                fingerprint: format_fingerprint(&fingerprint),
+                fingerprint: f.clone(),
                 ufrag: f.clone(),
                 pwd: f,
             };
@@ -464,11 +460,12 @@ impl WebRTCDirectTransport {
             .await?;
 
         // wait until data channel is opened and ready to use
-        let data_channel = data_channel_tx
-            .map_err(|e| Error::InternalError(e.to_string()))
-            .await?;
-
-        Ok(Connection::new(peer_connection, data_channel))
+        match tokio_crate::time::timeout(Duration::from_secs(10), data_channel_tx).await {
+            Ok(Ok(dc)) => Ok(Connection::new(peer_connection, dc)),
+            Err(_) | Ok(Err(_)) => Err(Error::InternalError(
+                "data channel opening took longer than 10 seconds".into(),
+            )),
+        }
     }
 }
 
@@ -504,19 +501,15 @@ fn multiaddr_to_socketaddr(addr: &Multiaddr) -> Option<SocketAddr> {
 }
 
 /// Turns an IP address and port into the corresponding WebRTC multiaddr.
-fn socketaddr_to_multiaddr<'a>(
-    socket_addr: &SocketAddr,
-    fingerprint: Cow<'a, [u8; 32]>,
-) -> Multiaddr {
-    Multiaddr::empty()
-        .with(socket_addr.ip().into())
-        .with(Protocol::Udp(socket_addr.port()))
-        .with(Protocol::XWebRTC(fingerprint))
-}
-
-fn fingerprint_to_hex_string(f: &Cow<'_, [u8; 32]>) -> String {
-    hex::encode(f.as_ref()).to_uppercase()
-}
+// fn socketaddr_to_multiaddr<'a>(
+//     socket_addr: &SocketAddr,
+//     fingerprint: Cow<'a, [u8; 32]>,
+// ) -> Multiaddr {
+//     Multiaddr::empty()
+//         .with(socket_addr.ip().into())
+//         .with(Protocol::Udp(socket_addr.port()))
+//         .with(Protocol::XWebRTC(fingerprint))
+// }
 
 fn format_fingerprint(f: &Cow<'_, [u8; 32]>) -> String {
     let values: Vec<String> = f.iter().map(|x| format! {"{:02x}", x}).collect();
@@ -528,7 +521,7 @@ fn format_fingerprint(f: &Cow<'_, [u8; 32]>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libp2p_core::{multiaddr::Protocol, Multiaddr, PeerId, Transport};
+    use libp2p_core::{multiaddr::Protocol, Multiaddr, Transport};
     use rcgen::KeyPair;
     use std::net::IpAddr;
     use std::net::{Ipv4Addr, Ipv6Addr};
@@ -611,18 +604,18 @@ mod tests {
         Cow::Owned(buf)
     }
 
-    #[test]
-    fn socketaddr_to_multiaddr_conversion() {
-        assert_eq!(
-            socketaddr_to_multiaddr(
-                &SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345,),
-                hex_to_cow("ACD1E533EC271FCDE0275947F4D62A2B2331FF10C9DDE0298EB7B399B4BFF60B"),
-            ),
-            "/ip4/127.0.0.1/udp/12345/x-webrtc/ACD1E533EC271FCDE0275947F4D62A2B2331FF10C9DDE0298EB7B399B4BFF60B"
-                .parse::<Multiaddr>()
-                .unwrap()
-        );
-    }
+    // #[test]
+    // fn socketaddr_to_multiaddr_conversion() {
+    //     assert_eq!(
+    //         socketaddr_to_multiaddr(
+    //             &SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345,),
+    //             hex_to_cow("ACD1E533EC271FCDE0275947F4D62A2B2331FF10C9DDE0298EB7B399B4BFF60B"),
+    //         ),
+    //         "/ip4/127.0.0.1/udp/12345/x-webrtc/ACD1E533EC271FCDE0275947F4D62A2B2331FF10C9DDE0298EB7B399B4BFF60B"
+    //             .parse::<Multiaddr>()
+    //             .unwrap()
+    //     );
+    // }
 
     #[tokio::test]
     async fn dialer_connects_to_listener_ipv4() {
@@ -639,11 +632,13 @@ mod tests {
     }
 
     async fn connect(listen_addr: SocketAddr) {
-        let kp = KeyPair::generate(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key pair");
-        let cert = RTCCertificate::from_key_pair(kp).expect("certificate");
-        let transport = WebRTCDirectTransport::new(cert, listen_addr)
-            .await
-            .expect("transport");
+        let transport = {
+            let kp = KeyPair::generate(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key pair");
+            let cert = RTCCertificate::from_key_pair(kp).expect("certificate");
+            WebRTCDirectTransport::new(cert, listen_addr)
+                .await
+                .expect("transport")
+        };
 
         let mut listener = transport
             .clone()
@@ -670,10 +665,20 @@ mod tests {
             conn.await
         };
 
-        let outbound = transport
-            .dial(addr.with(Protocol::XWebRTC(hex_to_cow(
-                "ACD1E533EC271FCDE0275947F4D62A2B2331FF10C9DDE0298EB7B399B4BFF60B",
-            ))))
+        let transport2 = {
+            let kp = KeyPair::generate(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key pair");
+            let cert = RTCCertificate::from_key_pair(kp).expect("certificate");
+            WebRTCDirectTransport::new(
+                cert,
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0),
+            )
+            .await
+            .expect("transport")
+        };
+        // TODO: make code cleaner wrt ":"
+        let f = &transport.cert_fingerprint().replace(":", "");
+        let outbound = transport2
+            .dial(addr.with(Protocol::XWebRTC(hex_to_cow(f))))
             .unwrap();
 
         let (a, b) = futures::join!(inbound, outbound);
