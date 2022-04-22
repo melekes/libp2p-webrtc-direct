@@ -164,7 +164,7 @@ a=fingerprint:sha-256 {fingerprint}
 a=setup:passive
 a=sctp-port:5000
 a=max-message-size:100000
-a=candidate:1 1 UDP 2113667327 {target_ip} {target_port} typ host
+a=candidate:1 1 UDP 1 {target_ip} {target_port} typ host
 ";
 
 /// Indicates the IP version used in WebRTC: `IP4` or `IP6`.

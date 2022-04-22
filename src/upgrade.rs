@@ -158,8 +158,9 @@ impl WebRTCUpgrade {
         // wait until data channel is opened and ready to use
         match tokio_crate::time::timeout(Duration::from_secs(10), data_channel_tx).await {
             Ok(Ok(dc)) => Ok(Connection::new(peer_connection, dc)),
-            Err(_) | Ok(Err(_)) => Err(Error::InternalError(
-                "data channel opening took longer than 10 seconds".into(),
+            Ok(Err(e)) => Err(Error::InternalError(e.to_string())),
+            Err(_) => Err(Error::InternalError(
+                "data channel opening took longer than 10 seconds (see logs)".into(),
             )),
         }
     }
