@@ -27,6 +27,7 @@ use tinytemplate::TinyTemplate;
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
+use webrtc::dtls_transport::dtls_role::DTLSRole;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
@@ -50,8 +51,6 @@ impl WebRTCUpgrade {
         trace!("upgrading {}", addr);
 
         let mut se = SettingEngine::default();
-        // Disable remote's fingerprint verification.
-        // se.disable_certificate_fingerprint_verification(true);
         // Act as a lite ICE (ICE which does not send additional candidates).
         se.set_lite(true);
         // Set both ICE user and password to fingerprint.
@@ -59,6 +58,14 @@ impl WebRTCUpgrade {
         let f = fingerprint_of_first_certificate(&config);
         se.set_ice_credentials(f.clone().replace(":", ""), f.replace(":", ""));
         se.set_udp_network(UDPNetwork::Muxed(udp_mux));
+        // Act as a DTLS server (one which waits for a connection).
+        //
+        // NOTE: removing this seems to break DTLS setup (both sides send `ClientHello` messages,
+        // but none end up responding).
+        se.set_answering_dtls_role(DTLSRole::Server)
+            .map_err(Error::WebRTC)?;
+        // Allow detaching data channels.
+        se.detach_data_channels();
 
         let api = APIBuilder::new().with_setting_engine(se).build();
         let peer_connection = api.new_peer_connection(config).await?;

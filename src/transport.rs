@@ -372,6 +372,8 @@ impl WebRTCDirectTransport {
             let f = self.cert_fingerprint();
             se.set_ice_credentials(f.clone().replace(":", ""), f.replace(":", ""));
             se.set_udp_network(UDPNetwork::Muxed(self.udp_mux.clone()));
+            // Allow detaching data channels.
+            se.detach_data_channels();
         }
 
         let api = APIBuilder::new().with_setting_engine(se).build();
