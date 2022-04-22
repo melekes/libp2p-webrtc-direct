@@ -145,14 +145,14 @@ impl WebRTCUpgrade {
             };
             tt.render("description", &context).unwrap()
         };
-        let sdp = RTCSessionDescription::offer(client_session_description.clone()).unwrap();
-        debug!("OFFER: {:?}", sdp);
+        debug!("OFFER: {:?}", client_session_description);
+        let sdp = RTCSessionDescription::offer(client_session_description).unwrap();
         peer_connection.set_remote_description(sdp).await?;
 
         let answer = peer_connection.create_answer(None).await?;
         // Set the local description and start UDP listeners
         // Note: this will start the gathering of ICE candidates
-        debug!("ANSWER: {:?}", answer);
+        debug!("ANSWER: {:?}", answer.sdp);
         peer_connection.set_local_description(answer).await?;
 
         // wait until data channel is opened and ready to use

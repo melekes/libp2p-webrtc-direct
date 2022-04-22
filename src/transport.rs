@@ -419,7 +419,7 @@ impl WebRTCDirectTransport {
             .create_offer(None)
             .map_err(Error::WebRTC)
             .await?;
-        debug!("OFFER: {:?}", offer);
+        debug!("OFFER: {:?}", offer.sdp);
         peer_connection
             .set_local_description(offer)
             .map_err(Error::WebRTC)
@@ -447,8 +447,8 @@ impl WebRTCDirectTransport {
             };
             tt.render("description", &context).unwrap()
         };
-        let sdp = RTCSessionDescription::answer(server_session_description.clone()).unwrap();
-        debug!("ANSWER: {:?}", sdp);
+        debug!("ANSWER: {:?}", server_session_description);
+        let sdp = RTCSessionDescription::answer(server_session_description).unwrap();
         // Set the local description and start UDP listeners
         // Note: this will start the gathering of ICE candidates
         peer_connection
