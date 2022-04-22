@@ -19,7 +19,6 @@
 // DEALINGS IN THE SOFTWARE.
 
 // What's left:
-// - [ ] make sure ufrag / psw are correct
 // - [ ] noise handshake on top of data channel
 // - [ ] peer ID
 
@@ -405,8 +404,11 @@ impl WebRTCDirectTransport {
                 let d2 = Arc::clone(&d);
                 Box::pin(async move {
                     match d2.detach().await {
-                        // TODO: remove unwrap
-                        Ok(detached) => data_channel_rx.send(detached).unwrap(),
+                        Ok(detached) => {
+                            if let Err(_) = data_channel_rx.send(detached) {
+                                error!("data_channel_tx dropped");
+                            }
+                        },
                         Err(e) => {
                             error!("Can't detach data channel: {}", e);
                         },
