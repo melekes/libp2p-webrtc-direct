@@ -23,18 +23,13 @@ use libp2p_core::multiaddr::{Multiaddr, Protocol};
 use log::{debug, error, trace};
 use std::sync::Arc;
 use std::time::Duration;
-use tinytemplate::TinyTemplate;
-use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::dtls_transport::dtls_role::DTLSRole;
 use webrtc::peer_connection::configuration::RTCConfiguration;
-use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc_data::data_channel::DataChannel as DetachedDataChannel;
-use webrtc_ice::network_type::NetworkType;
 use webrtc_ice::udp_mux::UDPMux;
-use webrtc_ice::udp_network::UDPNetwork;
 
 use crate::connection::Connection;
 use crate::error::Error;
@@ -54,32 +49,18 @@ impl WebRTCUpgrade {
         let socket_addr = transport::multiaddr_to_socketaddr(&addr)
             .ok_or_else(|| Error::InvalidMultiaddr(addr.clone()))?;
 
-        let mut se = SettingEngine::default();
-        // Act as a lite ICE (ICE which does not send additional candidates).
-        se.set_lite(true);
-        // Set both ICE user and password to fingerprint.
-        // It will be checked by remote side when exchanging ICE messages.
-        let f = fingerprint_of_first_certificate(&config);
-        se.set_ice_credentials(f.clone().replace(":", ""), f.replace(":", ""));
-        se.set_udp_network(UDPNetwork::Muxed(udp_mux));
-        // Act as a DTLS server (one which waits for a connection).
-        //
-        // NOTE: removing this seems to break DTLS setup (both sides send `ClientHello` messages,
-        // but none end up responding).
-        se.set_answering_dtls_role(DTLSRole::Server)
-            .map_err(Error::WebRTC)?;
-        // Allow detaching data channels.
-        se.detach_data_channels();
-        // Set the desired network type.
-        //
-        // NOTE: if not set, a [`webrtc_ice::agent::Agent`] might pick a wrong local candidate
-        // (e.g. IPv6 `[::1]` while dialing an IPv4 `10.11.12.13`).
-        let network_type = if socket_addr.is_ipv4() {
-            NetworkType::Udp4
-        } else {
-            NetworkType::Udp6
-        };
-        se.set_network_types(vec![network_type]);
+        let fingerprint = fingerprint_of_first_certificate(&config);
+        let mut se = transport::build_setting_engine(udp_mux, &socket_addr, &fingerprint);
+        {
+            // Act as a lite ICE (ICE which does not send additional candidates).
+            se.set_lite(true);
+            // Act as a DTLS server (one which waits for a connection).
+            //
+            // NOTE: removing this seems to break DTLS setup (both sides send `ClientHello` messages,
+            // but none end up responding).
+            se.set_answering_dtls_role(DTLSRole::Server)
+                .map_err(Error::WebRTC)?;
+        }
 
         let api = APIBuilder::new().with_setting_engine(se).build();
         let peer_connection = api.new_peer_connection(config).await?;
@@ -98,14 +79,6 @@ impl WebRTCUpgrade {
                 }),
             )
             .await?;
-
-        peer_connection
-            .on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
-                debug!("Peer Connection State has changed: {}", s);
-
-                Box::pin(async {})
-            }))
-            .await;
 
         let (data_channel_rx, data_channel_tx) = oneshot::channel::<Arc<DetachedDataChannel>>();
 
@@ -132,33 +105,18 @@ impl WebRTCUpgrade {
             .await;
 
         // Set the remote description to the predefined SDP
-        let client_session_description = {
-            let mut tt = TinyTemplate::new();
-            tt.add_template("description", sdp::CLIENT_SESSION_DESCRIPTION)
-                .unwrap();
-
-            let fingerprint = match addr.iter().last() {
-                Some(Protocol::XWebRTC(f)) => f,
-                _ => {
-                    debug!("{} is not a WebRTC multiaddr", addr);
-                    return Err(Error::InvalidMultiaddr(addr));
-                },
-            };
-            let f = transport::format_fingerprint(&fingerprint);
-            let context = sdp::DescriptionContext {
-                ip_version: if socket_addr.is_ipv4() {
-                    sdp::IpVersion::IP4
-                } else {
-                    sdp::IpVersion::IP6
-                },
-                target_ip: socket_addr.ip(),
-                target_port: socket_addr.port(),
-                fingerprint: f.clone(),
-                ufrag: f.clone().replace(":", ""),
-                pwd: f.replace(":", ""),
-            };
-            tt.render("description", &context).unwrap()
+        let fingerprint = match addr.iter().last() {
+            Some(Protocol::XWebRTC(f)) => f,
+            _ => {
+                debug!("{} is not a WebRTC multiaddr", addr);
+                return Err(Error::InvalidMultiaddr(addr));
+            },
         };
+        let client_session_description = transport::render_description(
+            sdp::CLIENT_SESSION_DESCRIPTION,
+            socket_addr,
+            &transport::format_fingerprint(&fingerprint),
+        );
         debug!("OFFER: {:?}", client_session_description);
         let sdp = RTCSessionDescription::offer(client_session_description).unwrap();
         peer_connection.set_remote_description(sdp).await?;

@@ -23,7 +23,6 @@
 // - [ ] peer ID
 
 use libp2p_core::{
-    address_translation,
     multiaddr::{Multiaddr, Protocol},
     transport::{ListenerEvent, TransportError},
     Transport,
@@ -43,7 +42,6 @@ use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
 use webrtc::peer_connection::certificate::RTCCertificate;
 use webrtc::peer_connection::configuration::RTCConfiguration;
-use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc_data::data_channel::DataChannel as DetachedDataChannel;
 use webrtc_ice::network_type::NetworkType;
@@ -101,7 +99,7 @@ pub struct WebRTCDirectTransport {
 impl WebRTCDirectTransport {
     /// Create a new WebRTC transport.
     ///
-    /// Creates a UDP socket bound to `listen_addr`. `listen_on` must be called to start listening.
+    /// Creates a UDP socket bound to `listen_addr`.
     pub async fn new<A: ToSocketAddrs>(
         certificate: RTCCertificate,
         listen_addr: A,
@@ -111,11 +109,12 @@ impl WebRTCDirectTransport {
             .map_err(Error::IoError)
             .map_err(TransportError::Other)
             .await?;
+        // sender and receiver for new addresses
+        let (new_addr_tx, new_addr_rx) = mpsc::channel(1);
         let udp_mux_addr = socket
             .local_addr()
             .map_err(Error::IoError)
             .map_err(TransportError::Other)?;
-        let (new_addr_tx, new_addr_rx) = mpsc::channel(1);
         let udp_mux = UDPMuxNewAddr::new(UDPMuxParams::new(socket), new_addr_tx);
 
         Ok(Self {
@@ -152,7 +151,7 @@ impl Transport for WebRTCDirectTransport {
     type Dial = BoxFuture<'static, Result<Self::Output, Self::Error>>;
 
     fn listen_on(self, addr: Multiaddr) -> Result<Self::Listener, TransportError<Self::Error>> {
-        log::debug!("listening on {} (ignoring {})", self.udp_mux_addr, addr);
+        debug!("listening on {} (ignoring {})", self.udp_mux_addr, addr);
         Ok(WebRTCListenStream::new(
             self.udp_mux_addr,
             self.config.clone(),
@@ -166,11 +165,13 @@ impl Transport for WebRTCDirectTransport {
     }
 
     fn dial_as_listener(self, addr: Multiaddr) -> Result<Self::Dial, TransportError<Self::Error>> {
+        // XXX: anything to do here?
         self.dial(addr)
     }
 
     fn address_translation(&self, server: &Multiaddr, observed: &Multiaddr) -> Option<Multiaddr> {
-        address_translation(server, observed)
+        // XXX: anything to do here?
+        libp2p_core::address_translation(server, observed)
     }
 }
 
@@ -254,7 +255,7 @@ impl Stream for WebRTCListenStream {
                             continue;
                         },
                         Err(err) => {
-                            log::debug! {
+                            debug! {
                                 "Failed to begin observing interfaces: {:?}. Scheduling retry.",
                                 err
                             };
@@ -275,7 +276,7 @@ impl Stream for WebRTCListenStream {
                                         || me.listen_addr.is_ipv6() == ip.is_ipv6()
                                     {
                                         let ma = ip_to_multiaddr(ip, me.listen_addr.port());
-                                        log::debug!("New listen address: {}", ma);
+                                        debug!("New listen address: {}", ma);
                                         return Poll::Ready(Some(Ok(ListenerEvent::NewAddress(
                                             ma,
                                         ))));
@@ -287,14 +288,14 @@ impl Stream for WebRTCListenStream {
                                         || me.listen_addr.is_ipv6() == ip.is_ipv6()
                                     {
                                         let ma = ip_to_multiaddr(ip, me.listen_addr.port());
-                                        log::debug!("Expired listen address: {}", ma);
+                                        debug!("Expired listen address: {}", ma);
                                         return Poll::Ready(Some(Ok(
                                             ListenerEvent::AddressExpired(ma),
                                         )));
                                     }
                                 },
                                 Err(err) => {
-                                    log::debug! {
+                                    debug! {
                                         "Failure polling interfaces: {:?}. Scheduling retry.",
                                         err
                                     };
@@ -307,8 +308,8 @@ impl Stream for WebRTCListenStream {
                         }
                     },
                 },
-                // If the listener is bound to a single interface, make sure the
-                // address is registered for port reuse and reported once.
+                // If the listener is bound to a single interface, make sure the address reported
+                // once.
                 InAddr::One { out } => {
                     if let Some(multiaddr) = out.take() {
                         return Poll::Ready(Some(Ok(ListenerEvent::NewAddress(multiaddr))));
@@ -326,6 +327,7 @@ impl Stream for WebRTCListenStream {
                 }
             }
 
+            // safe to unwrap here since this is the only place `new_addr_rx` is locked.
             return match Pin::new(&mut *me.new_addr_rx.lock().unwrap()).poll_next(cx) {
                 Poll::Ready(Some(addr)) => Poll::Ready(Some(Ok(ListenerEvent::Upgrade {
                     local_addr: ip_to_multiaddr(me.listen_addr.ip(), me.listen_addr.port()),
@@ -351,41 +353,13 @@ impl WebRTCDirectTransport {
             return Err(Error::InvalidMultiaddr(addr.clone()));
         }
 
-        let fingerprint = match addr.iter().last() {
-            Some(Protocol::XWebRTC(f)) => f,
-            _ => {
-                debug!("{} is not a WebRTC multiaddr", addr);
-                return Err(Error::InvalidMultiaddr(addr));
-            },
-        };
-
         let config = self.config.clone();
 
         let remote = addr.clone(); // used for logging
-
         trace!("dialing address: {:?}", remote);
 
-        let mut se = SettingEngine::default();
-        {
-            // Set both ICE user and password to fingerprint.
-            // It will be checked by remote side when exchanging ICE messages.
-            let f = self.cert_fingerprint();
-            se.set_ice_credentials(f.clone().replace(":", ""), f.replace(":", ""));
-            se.set_udp_network(UDPNetwork::Muxed(self.udp_mux.clone()));
-            // Allow detaching data channels.
-            se.detach_data_channels();
-            // Set the desired network type.
-            //
-            // NOTE: if not set, a [`webrtc_ice::agent::Agent`] might pick a wrong local candidate
-            // (e.g. IPv6 `[::1]` while dialing an IPv4 `10.11.12.13`).
-            let network_type = if socket_addr.is_ipv4() {
-                NetworkType::Udp4
-            } else {
-                NetworkType::Udp6
-            };
-            se.set_network_types(vec![network_type]);
-        }
-
+        let fingerprint = self.cert_fingerprint();
+        let se = build_setting_engine(self.udp_mux.clone(), &socket_addr, &fingerprint);
         let api = APIBuilder::new().with_setting_engine(se).build();
 
         let peer_connection = api
@@ -395,14 +369,6 @@ impl WebRTCDirectTransport {
 
         // Create a datachannel with label 'data'
         let data_channel = peer_connection.create_data_channel("data", None).await?;
-
-        peer_connection
-            .on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
-                debug!("Peer Connection State has changed: {}", s);
-
-                Box::pin(async {})
-            }))
-            .await;
 
         let (data_channel_rx, data_channel_tx) = oneshot::channel::<Arc<DetachedDataChannel>>();
 
@@ -438,28 +404,17 @@ impl WebRTCDirectTransport {
             .map_err(Error::WebRTC)
             .await?;
 
-        let server_session_description = {
-            let mut tt = TinyTemplate::new();
-            tt.add_template("description", sdp::SERVER_SESSION_DESCRIPTION)
-                .unwrap();
-
-            let f = format_fingerprint(&fingerprint);
-            let context = sdp::DescriptionContext {
-                ip_version: {
-                    if socket_addr.is_ipv4() {
-                        sdp::IpVersion::IP4
-                    } else {
-                        sdp::IpVersion::IP6
-                    }
-                },
-                target_ip: socket_addr.ip(),
-                target_port: socket_addr.port(),
-                fingerprint: f.clone(),
-                ufrag: f.clone().replace(":", ""),
-                pwd: f.replace(":", ""),
-            };
-            tt.render("description", &context).unwrap()
+        let fingerprint = match addr.iter().last() {
+            Some(Protocol::XWebRTC(f)) => f,
+            _ => {
+                return Err(Error::InvalidMultiaddr(addr));
+            },
         };
+        let server_session_description = render_description(
+            sdp::SERVER_SESSION_DESCRIPTION,
+            socket_addr,
+            &format_fingerprint(&fingerprint),
+        );
         debug!("ANSWER: {:?}", server_session_description);
         let sdp = RTCSessionDescription::answer(server_session_description).unwrap();
         // Set the local description and start UDP listeners
@@ -480,9 +435,32 @@ impl WebRTCDirectTransport {
     }
 }
 
-// Create a [`Multiaddr`] from the given IP address and port number.
+/// Creates a [`Multiaddr`] from the given IP address and port number.
 fn ip_to_multiaddr(ip: IpAddr, port: u16) -> Multiaddr {
     Multiaddr::empty().with(ip.into()).with(Protocol::Udp(port))
+}
+
+/// Renders a [`TinyTemplate`] description using the provided arguments.
+pub(crate) fn render_description(description: &str, addr: SocketAddr, fingerprint: &str) -> String {
+    let mut tt = TinyTemplate::new();
+    tt.add_template("description", description).unwrap();
+
+    let f = fingerprint.to_owned().replace(":", "");
+    let context = sdp::DescriptionContext {
+        ip_version: {
+            if addr.is_ipv4() {
+                sdp::IpVersion::IP4
+            } else {
+                sdp::IpVersion::IP6
+            }
+        },
+        target_ip: addr.ip(),
+        target_port: addr.port(),
+        fingerprint: fingerprint.to_owned(),
+        ufrag: f.clone(),
+        pwd: f,
+    };
+    tt.render("description", &context).unwrap()
 }
 
 /// Tries to turn a WebRTC multiaddress into a [`SocketAddr`]. Returns None if the format of the
@@ -525,6 +503,33 @@ pub(crate) fn multiaddr_to_socketaddr(addr: &Multiaddr) -> Option<SocketAddr> {
 pub(crate) fn format_fingerprint(f: &Cow<'_, [u8; 32]>) -> String {
     let values: Vec<String> = f.iter().map(|x| format! {"{:02x}", x}).collect();
     values.join(":")
+}
+
+/// Creates a new [`SettingEngine`] and configures it.
+pub(crate) fn build_setting_engine(
+    udp_mux: Arc<dyn UDPMux + Send + Sync>,
+    addr: &SocketAddr,
+    fingerprint: &str,
+) -> SettingEngine {
+    let mut se = SettingEngine::default();
+    // Set both ICE user and password to fingerprint.
+    // It will be checked by remote side when exchanging ICE messages.
+    let f = fingerprint.to_owned().replace(":", "");
+    se.set_ice_credentials(f.clone(), f);
+    se.set_udp_network(UDPNetwork::Muxed(udp_mux.clone()));
+    // Allow detaching data channels.
+    se.detach_data_channels();
+    // Set the desired network type.
+    //
+    // NOTE: if not set, a [`webrtc_ice::agent::Agent`] might pick a wrong local candidate
+    // (e.g. IPv6 `[::1]` while dialing an IPv4 `10.11.12.13`).
+    let network_type = if addr.is_ipv4() {
+        NetworkType::Udp4
+    } else {
+        NetworkType::Udp6
+    };
+    se.set_network_types(vec![network_type]);
+    se
 }
 
 // Tests //////////////////////////////////////////////////////////////////////////////////////////
