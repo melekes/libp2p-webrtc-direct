@@ -32,6 +32,7 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc_data::data_channel::DataChannel as DetachedDataChannel;
+use webrtc_ice::network_type::NetworkType;
 use webrtc_ice::udp_mux::UDPMux;
 use webrtc_ice::udp_network::UDPNetwork;
 
@@ -50,6 +51,9 @@ impl WebRTCUpgrade {
     ) -> Result<Connection<'static>, Error> {
         trace!("upgrading {}", addr);
 
+        let socket_addr = transport::multiaddr_to_socketaddr(&addr)
+            .ok_or_else(|| Error::InvalidMultiaddr(addr.clone()))?;
+
         let mut se = SettingEngine::default();
         // Act as a lite ICE (ICE which does not send additional candidates).
         se.set_lite(true);
@@ -66,6 +70,16 @@ impl WebRTCUpgrade {
             .map_err(Error::WebRTC)?;
         // Allow detaching data channels.
         se.detach_data_channels();
+        // Set the desired network type.
+        //
+        // NOTE: if not set, a [`webrtc_ice::agent::Agent`] might pick a wrong local candidate
+        // (e.g. IPv6 `[::1]` while dialing an IPv4 `10.11.12.13`).
+        let network_type = if socket_addr.is_ipv4() {
+            NetworkType::Udp4
+        } else {
+            NetworkType::Udp6
+        };
+        se.set_network_types(vec![network_type]);
 
         let api = APIBuilder::new().with_setting_engine(se).build();
         let peer_connection = api.new_peer_connection(config).await?;
@@ -116,9 +130,6 @@ impl WebRTCUpgrade {
                 })
             }))
             .await;
-
-        let socket_addr = transport::multiaddr_to_socketaddr(&addr)
-            .ok_or_else(|| Error::InvalidMultiaddr(addr.clone()))?;
 
         // Set the remote description to the predefined SDP
         let client_session_description = {
