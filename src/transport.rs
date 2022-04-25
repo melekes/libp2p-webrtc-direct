@@ -46,6 +46,7 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc_data::data_channel::DataChannel as DetachedDataChannel;
+use webrtc_ice::network_type::NetworkType;
 use webrtc_ice::udp_mux::UDPMux;
 use webrtc_ice::udp_network::UDPNetwork;
 
@@ -373,6 +374,16 @@ impl WebRTCDirectTransport {
             se.set_udp_network(UDPNetwork::Muxed(self.udp_mux.clone()));
             // Allow detaching data channels.
             se.detach_data_channels();
+            // Set the desired network type.
+            //
+            // NOTE: if not set, a [`webrtc_ice::agent::Agent`] might pick a wrong local candidate
+            // (e.g. IPv6 `[::1]` while dialing an IPv4 `10.11.12.13`).
+            let network_type = if socket_addr.is_ipv4() {
+                NetworkType::Udp4
+            } else {
+                NetworkType::Udp6
+            };
+            se.set_network_types(vec![network_type]);
         }
 
         let api = APIBuilder::new().with_setting_engine(se).build();
@@ -668,12 +679,10 @@ mod tests {
         let transport2 = {
             let kp = KeyPair::generate(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key pair");
             let cert = RTCCertificate::from_key_pair(kp).expect("certificate");
-            WebRTCDirectTransport::new(
-                cert,
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0),
-            )
-            .await
-            .expect("transport")
+            // okay to reuse `listen_addr` since the port is `0` (any).
+            WebRTCDirectTransport::new(cert, listen_addr)
+                .await
+                .expect("transport")
         };
         // TODO: make code cleaner wrt ":"
         let f = &transport.cert_fingerprint().replace(":", "");

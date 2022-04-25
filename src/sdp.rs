@@ -130,8 +130,8 @@ a=max-message-size:100000
 ///     it. Note however that the TLS ID in the answer must be present if and only if the
 ///     offer contains one. (RFC8842)
 ///     TODO: is it true that renegotiations never happen? what about a connection closing?
-///     TODO: right now browsers don't send it "a=tls-id:" + genRandomPayload(120) + "\n" +
 ///     "tls-id" attribute MUST be present in the initial offer and respective answer (RFC8839).
+///     XXX: but right now browsers don't send it.
 ///
 /// a=setup:passive
 ///
@@ -143,7 +143,6 @@ a=max-message-size:100000
 ///     Note that if the answerer uses setup:passive, then the DTLS handshake will not begin until
 ///     the answerer is received, which adds additional latency. setup:active allows the answer and
 ///     the DTLS handshake to occur in parallel. Thus, setup:active is RECOMMENDED.
-///     TODO: should we use active setup?
 ///
 /// a=candidate:<foundation> <component-id> <transport> <priority> <connection-address> <port> <cand-type>
 ///
