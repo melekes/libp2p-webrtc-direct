@@ -31,6 +31,4 @@ pub enum Error {
     IoError(#[from] std::io::Error),
     #[error("internal error: {0} (see debug logs)")]
     InternalError(String),
-    #[error("noise error: {0}")]
-    Noise(#[from] libp2p_noise::NoiseError),
 }

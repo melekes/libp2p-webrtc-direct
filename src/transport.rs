@@ -32,9 +32,6 @@ use futures::{
 };
 use futures_timer::Delay;
 use if_watch::{IfEvent, IfWatcher};
-use libp2p_core::identity;
-use libp2p_core::{OutboundUpgrade, UpgradeInfo};
-use libp2p_noise::{Keypair, NoiseConfig, NoiseError, RemoteIdentity, X25519Spec};
 use log::{debug, error, trace};
 use tinytemplate::TinyTemplate;
 use tokio_crate::net::{ToSocketAddrs, UdpSocket};
@@ -61,7 +58,7 @@ use std::time::Duration;
 use crate::error::Error;
 use crate::sdp;
 
-use crate::connection::{Connection, PollDataChannel};
+use crate::connection::Connection;
 use crate::udp_mux::UDPMuxNewAddr;
 use crate::udp_mux::UDPMuxParams;
 use crate::upgrade::WebRTCUpgrade;
@@ -79,7 +76,7 @@ enum InAddr {
     Any { if_watch: IfWatch },
 }
 
-/// A WebRTC direct transport.
+/// A WebRTC transport with direct p2p communication (without a STUN server).
 #[derive(Clone)]
 pub struct WebRTCDirectTransport {
     /// A `RTCConfiguration` which holds this peer's certificate(s).

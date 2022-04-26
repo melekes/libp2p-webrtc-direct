@@ -21,7 +21,6 @@
 mod poll_data_channel;
 
 use futures::prelude::*;
-use libp2p_core::PeerId;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc_data::data_channel::DataChannel;
 
@@ -30,7 +29,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-pub(crate) use poll_data_channel::PollDataChannel;
+use poll_data_channel::PollDataChannel;
 
 /// A WebRTC connection over a single data channel. See lib documentation for
 /// the reasoning as to why a single data channel is being used.

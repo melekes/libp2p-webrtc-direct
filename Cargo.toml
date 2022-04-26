@@ -9,32 +9,17 @@ edition = "2021"
 publish = false
 
 [dependencies]
-anyhow = "1.0.56"
 bytes = "1"
-chrono = "0.4.19"
-clap = { version = "3.1.6", features = ["derive"] }
-ctrlc = "3.2.1"
-either = "1.5.3"
 env_logger = "0.9.0"
 futures = "0.3.17"
-futures-rustls = "0.22"
 hex = "0.4"
 libp2p-core = { version = "0.32.0", default-features = false, git = "https://github.com/melekes/rust-libp2p", branch = "anton/x-webrtc"  }
-libp2p-noise = { version = "0.35.0", git = "https://github.com/melekes/rust-libp2p", branch = "anton/x-webrtc" }
 log = "0.4.14"
-quicksink = "0.1"
-rcgen = "0.8.14"
-rustls = "0.19.0"
-rustls-pemfile = "0.3.0"
-rw-stream-sink = "0.2.0"
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "1"
 tinytemplate = "1.2"
 tokio-crate = { package = "tokio", version = "1.17.0", default-features = false, features = ["net"]}
-url = "2.1"
-webpki-roots = "0.22"
 webrtc = { version = "0.4.0", git = "https://github.com/melekes/webrtc", branch = "anton/168-allow-persistent-certificates" }
-webrtc-dtls = "0.5.2"
 webrtc-ice = "0.6.6"
 webrtc-data = "0.3.3"
 webrtc-sctp = "0.4.3"
@@ -43,3 +28,6 @@ futures-timer = "3.0"
 stun = "0.4.2"
 webrtc-util = { version = "0.5.3", default-features = false, features = ["conn", "vnet", "sync"] }
 async-trait = "0.1.52"
+
+[dev-dependencies]
+rcgen = "0.8.14"

@@ -19,12 +19,7 @@
 // DEALINGS IN THE SOFTWARE.
 
 use futures::channel::oneshot;
-use futures::prelude::*;
-use futures::TryFutureExt;
-use libp2p_core::identity;
 use libp2p_core::multiaddr::{Multiaddr, Protocol};
-use libp2p_core::{InboundUpgrade, UpgradeInfo};
-use libp2p_noise::{Keypair, NoiseConfig, NoiseError, RemoteIdentity, X25519Spec};
 use log::{debug, error, trace};
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
@@ -37,7 +32,7 @@ use webrtc_ice::udp_mux::UDPMux;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::connection::{Connection, PollDataChannel};
+use crate::connection::Connection;
 use crate::error::Error;
 use crate::sdp;
 use crate::transport;
