@@ -20,6 +20,7 @@ futures = "0.3.17"
 futures-rustls = "0.22"
 hex = "0.4"
 libp2p-core = { version = "0.32.0", default-features = false, git = "https://github.com/melekes/rust-libp2p", branch = "anton/x-webrtc"  }
+libp2p-noise = { version = "0.35.0", git = "https://github.com/melekes/rust-libp2p", branch = "anton/x-webrtc" }
 log = "0.4.14"
 quicksink = "0.1"
 rcgen = "0.8.14"
@@ -32,9 +33,9 @@ tinytemplate = "1.2"
 tokio-crate = { package = "tokio", version = "1.17.0", default-features = false, features = ["net"]}
 url = "2.1"
 webpki-roots = "0.22"
-webrtc = { version = "0.4.0", git = "https://github.com/melekes/webrtc", branch = "anton/168-allow-persistent-certificates" }
+webrtc = { version = "0.4.0", path = "/Users/anton/Work/github-forks/webrtc" }
 webrtc-dtls = "0.5.2"
-webrtc-ice = "0.6.6"
+webrtc-ice = { version = "0.6.6", path = "/Users/anton/Work/github-forks/ice" }
 webrtc-data = "0.3.3"
 webrtc-sctp = "0.4.3"
 if-watch = "0.2.2"

@@ -19,10 +19,13 @@
 // DEALINGS IN THE SOFTWARE.
 
 use futures::channel::oneshot;
+use futures::prelude::*;
+use futures::TryFutureExt;
+use libp2p_core::identity;
 use libp2p_core::multiaddr::{Multiaddr, Protocol};
+use libp2p_core::{InboundUpgrade, UpgradeInfo};
+use libp2p_noise::{Keypair, NoiseConfig, NoiseError, RemoteIdentity, X25519Spec};
 use log::{debug, error, trace};
-use std::sync::Arc;
-use std::time::Duration;
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::dtls_transport::dtls_role::DTLSRole;
@@ -30,6 +33,9 @@ use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc_data::data_channel::DataChannel as DetachedDataChannel;
 use webrtc_ice::udp_mux::UDPMux;
+
+use std::sync::Arc;
+use std::time::Duration;
 
 use crate::connection::Connection;
 use crate::error::Error;
@@ -127,12 +133,34 @@ impl WebRTCUpgrade {
         peer_connection.set_local_description(answer).await?;
 
         // wait until data channel is opened and ready to use
-        match tokio_crate::time::timeout(Duration::from_secs(10), data_channel_tx).await {
-            Ok(Ok(dc)) => Ok(Connection::new(peer_connection, dc)),
-            Ok(Err(e)) => Err(Error::InternalError(e.to_string())),
-            Err(_) => Err(Error::InternalError(
-                "data channel opening took longer than 10 seconds (see logs)".into(),
-            )),
-        }
+        let data_channel =
+            match tokio_crate::time::timeout(Duration::from_secs(10), data_channel_tx).await {
+                Ok(Ok(dc)) => dc,
+                Ok(Err(e)) => return Err(Error::InternalError(e.to_string())),
+                Err(_) => {
+                    return Err(Error::InternalError(
+                        "data channel opening took longer than 10 seconds (see logs)".into(),
+                    ))
+                },
+            };
+
+        // noise handshake
+        let id_keys = identity::Keypair::generate_ed25519();
+        let dh_keys = Keypair::<X25519Spec>::new()
+            .into_authentic(&id_keys)
+            .unwrap();
+        let noise = NoiseConfig::xx(dh_keys);
+        // after noise is successful and we've authenticated the remote peer, encrypted IO is no
+        // longer needed, hence ignored here.
+        let (peer_id, _) = noise
+            .upgrade_inbound(data_channel, noise.protocol_info().next().unwrap())
+            .and_then(|(remote, io)| match remote {
+                RemoteIdentity::IdentityKey(pk) => future::ok((pk.to_peer_id(), io)),
+                _ => future::err(NoiseError::AuthenticationFailed),
+            })
+            .await
+            .map_err(Error::Noise)?;
+
+        Ok(Connection::new(peer_connection, data_channel, peer_id))
     }
 }

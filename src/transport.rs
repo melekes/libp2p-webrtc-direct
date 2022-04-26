@@ -18,10 +18,6 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-// What's left:
-// - [ ] noise handshake on top of data channel
-// - [ ] peer ID
-
 use libp2p_core::{
     multiaddr::{Multiaddr, Protocol},
     transport::{ListenerEvent, TransportError},
@@ -32,12 +28,16 @@ use futures::{
     channel::{mpsc, oneshot},
     future::BoxFuture,
     prelude::*,
-    ready,
+    ready, TryFutureExt,
 };
 use futures_timer::Delay;
 use if_watch::{IfEvent, IfWatcher};
+use libp2p_core::identity;
+use libp2p_core::{OutboundUpgrade, UpgradeInfo};
+use libp2p_noise::{Keypair, NoiseConfig, NoiseError, RemoteIdentity, X25519Spec};
 use log::{debug, error, trace};
 use tinytemplate::TinyTemplate;
+use tokio_crate::net::{ToSocketAddrs, UdpSocket};
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
 use webrtc::peer_connection::certificate::RTCCertificate;
@@ -47,8 +47,6 @@ use webrtc_data::data_channel::DataChannel as DetachedDataChannel;
 use webrtc_ice::network_type::NetworkType;
 use webrtc_ice::udp_mux::UDPMux;
 use webrtc_ice::udp_network::UDPNetwork;
-
-use tokio_crate::net::{ToSocketAddrs, UdpSocket};
 
 use std::borrow::Cow;
 use std::io;
@@ -418,13 +416,35 @@ impl WebRTCDirectTransport {
             .await?;
 
         // wait until data channel is opened and ready to use
-        match tokio_crate::time::timeout(Duration::from_secs(10), data_channel_tx).await {
-            Ok(Ok(dc)) => Ok(Connection::new(peer_connection, dc)),
-            Ok(Err(e)) => Err(Error::InternalError(e.to_string())),
-            Err(_) => Err(Error::InternalError(
-                "data channel opening took longer than 10 seconds (see logs)".into(),
-            )),
-        }
+        let data_channel =
+            match tokio_crate::time::timeout(Duration::from_secs(10), data_channel_tx).await {
+                Ok(Ok(dc)) => dc,
+                Ok(Err(e)) => return Err(Error::InternalError(e.to_string())),
+                Err(_) => {
+                    return Err(Error::InternalError(
+                        "data channel opening took longer than 10 seconds (see logs)".into(),
+                    ))
+                },
+            };
+
+        // noise handshake
+        let id_keys = identity::Keypair::generate_ed25519();
+        let dh_keys = Keypair::<X25519Spec>::new()
+            .into_authentic(&id_keys)
+            .unwrap();
+        let noise = NoiseConfig::xx(dh_keys);
+        // after noise is successful and we've authenticated the remote peer, encrypted IO is no
+        // longer needed, hence ignored here.
+        let (peer_id, _) = noise
+            .upgrade_outbound(data_channel, noise.protocol_info().next().unwrap())
+            .and_then(|(remote, io)| match remote {
+                RemoteIdentity::IdentityKey(pk) => future::ok((pk.to_peer_id(), io)),
+                _ => future::err(NoiseError::AuthenticationFailed),
+            })
+            .await
+            .map_err(Error::Noise)?;
+
+        Ok(Connection::new(peer_connection, data_channel, peer_id))
     }
 }
 
