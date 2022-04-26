@@ -33,9 +33,9 @@ tinytemplate = "1.2"
 tokio-crate = { package = "tokio", version = "1.17.0", default-features = false, features = ["net"]}
 url = "2.1"
 webpki-roots = "0.22"
-webrtc = { version = "0.4.0", path = "/Users/anton/Work/github-forks/webrtc" }
+webrtc = { version = "0.4.0", git = "https://github.com/melekes/webrtc", branch = "anton/168-allow-persistent-certificates" }
 webrtc-dtls = "0.5.2"
-webrtc-ice = { version = "0.6.6", path = "/Users/anton/Work/github-forks/ice" }
+webrtc-ice = "0.6.6"
 webrtc-data = "0.3.3"
 webrtc-sctp = "0.4.3"
 if-watch = "0.2.2"
