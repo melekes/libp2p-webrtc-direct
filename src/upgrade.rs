@@ -48,8 +48,8 @@ impl WebRTCUpgrade {
 
         let socket_addr = transport::multiaddr_to_socketaddr(&addr)
             .ok_or_else(|| Error::InvalidMultiaddr(addr.clone()))?;
+        let fingerprint = transport::fingerprint_of_first_certificate(&config);
 
-        let fingerprint = fingerprint_of_first_certificate(&config);
         let mut se = transport::build_setting_engine(udp_mux, &socket_addr, &fingerprint);
         {
             // Act as a lite ICE (ICE which does not send additional candidates).
@@ -61,11 +61,10 @@ impl WebRTCUpgrade {
             se.set_answering_dtls_role(DTLSRole::Server)
                 .map_err(Error::WebRTC)?;
         }
-
         let api = APIBuilder::new().with_setting_engine(se).build();
         let peer_connection = api.new_peer_connection(config).await?;
 
-        // Create a datachannel with label 'data'
+        // Create a datachannel with label 'data'.
         let data_channel = peer_connection
             .create_data_channel(
                 "data",
@@ -82,7 +81,7 @@ impl WebRTCUpgrade {
 
         let (data_channel_rx, data_channel_tx) = oneshot::channel::<Arc<DetachedDataChannel>>();
 
-        // Register channel opening handling
+        // Wait until the data channel is opened and detach it.
         let d = Arc::clone(&data_channel);
         data_channel
             .on_open(Box::new(move || {
@@ -104,7 +103,7 @@ impl WebRTCUpgrade {
             }))
             .await;
 
-        // Set the remote description to the predefined SDP
+        // Set the remote description to the predefined SDP.
         let fingerprint = match addr.iter().last() {
             Some(Protocol::XWebRTC(f)) => f,
             _ => {
@@ -115,7 +114,7 @@ impl WebRTCUpgrade {
         let client_session_description = transport::render_description(
             sdp::CLIENT_SESSION_DESCRIPTION,
             socket_addr,
-            &transport::format_fingerprint(&fingerprint),
+            &transport::fingerprint_to_string(&fingerprint),
         );
         debug!("OFFER: {:?}", client_session_description);
         let sdp = RTCSessionDescription::offer(client_session_description).unwrap();
@@ -136,14 +135,4 @@ impl WebRTCUpgrade {
             )),
         }
     }
-}
-
-fn fingerprint_of_first_certificate(config: &RTCConfiguration) -> String {
-    let fingerprints = config
-        .certificates
-        .first()
-        .expect("at least one certificate")
-        .get_fingerprints()
-        .expect("fingerprints to succeed");
-    fingerprints.first().unwrap().value.to_owned()
 }

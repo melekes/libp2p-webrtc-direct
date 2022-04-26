@@ -131,15 +131,7 @@ impl WebRTCDirectTransport {
     /// Returns the SHA-256 fingerprint of the certificate in lowercase hex string as expressed
     /// utilizing the syntax of 'fingerprint' in <https://tools.ietf.org/html/rfc4572#section-5>.
     fn cert_fingerprint(&self) -> String {
-        // safe to unwrap here because we require a certificate above
-        let fingerprints = self
-            .config
-            .certificates
-            .first()
-            .expect("at least one certificate")
-            .get_fingerprints()
-            .expect("fingerprints to succeed");
-        fingerprints.first().unwrap().value.to_owned()
+        fingerprint_of_first_certificate(&self.config)
     }
 }
 
@@ -372,7 +364,7 @@ impl WebRTCDirectTransport {
 
         let (data_channel_rx, data_channel_tx) = oneshot::channel::<Arc<DetachedDataChannel>>();
 
-        // Register channel opening handling
+        // Wait until the data channel is opened and detach it.
         let d = Arc::clone(&data_channel);
         data_channel
             .on_open(Box::new(move || {
@@ -404,6 +396,7 @@ impl WebRTCDirectTransport {
             .map_err(Error::WebRTC)
             .await?;
 
+        // Set the remote description to the predefined SDP.
         let fingerprint = match addr.iter().last() {
             Some(Protocol::XWebRTC(f)) => f,
             _ => {
@@ -413,7 +406,7 @@ impl WebRTCDirectTransport {
         let server_session_description = render_description(
             sdp::SERVER_SESSION_DESCRIPTION,
             socket_addr,
-            &format_fingerprint(&fingerprint),
+            &fingerprint_to_string(&fingerprint),
         );
         debug!("ANSWER: {:?}", server_session_description);
         let sdp = RTCSessionDescription::answer(server_session_description).unwrap();
@@ -456,7 +449,9 @@ pub(crate) fn render_description(description: &str, addr: SocketAddr, fingerprin
         },
         target_ip: addr.ip(),
         target_port: addr.port(),
+        // hashing algorithm (SHA-256) is hardcoded for now
         fingerprint: fingerprint.to_owned(),
+        // ufrag and pwd are both equal to the fingerprint (minus the `:` delimiter)
         ufrag: f.clone(),
         pwd: f,
     };
@@ -489,20 +484,26 @@ pub(crate) fn multiaddr_to_socketaddr(addr: &Multiaddr) -> Option<SocketAddr> {
     }
 }
 
-/// Turns an IP address and port into the corresponding WebRTC multiaddr.
-// fn socketaddr_to_multiaddr<'a>(
-//     socket_addr: &SocketAddr,
-//     fingerprint: Cow<'a, [u8; 32]>,
-// ) -> Multiaddr {
-//     Multiaddr::empty()
-//         .with(socket_addr.ip().into())
-//         .with(Protocol::Udp(socket_addr.port()))
-//         .with(Protocol::XWebRTC(fingerprint))
-// }
-
-pub(crate) fn format_fingerprint(f: &Cow<'_, [u8; 32]>) -> String {
+/// Transforms a byte array fingerprint into a string.
+pub(crate) fn fingerprint_to_string(f: &Cow<'_, [u8; 32]>) -> String {
     let values: Vec<String> = f.iter().map(|x| format! {"{:02x}", x}).collect();
     values.join(":")
+}
+
+/// Returns a fingerprint of the first certificate.
+///
+/// # Panics
+///
+/// Panics if the config does not contain any certificates.
+pub(crate) fn fingerprint_of_first_certificate(config: &RTCConfiguration) -> String {
+    // safe to unwrap here because we require a certificate during construction.
+    let fingerprints = config
+        .certificates
+        .first()
+        .expect("at least one certificate")
+        .get_fingerprints()
+        .expect("fingerprints to succeed");
+    fingerprints.first().unwrap().value.to_owned()
 }
 
 /// Creates a new [`SettingEngine`] and configures it.
@@ -619,19 +620,6 @@ mod tests {
         hex::decode_to_slice(s, &mut buf).unwrap();
         Cow::Owned(buf)
     }
-
-    // #[test]
-    // fn socketaddr_to_multiaddr_conversion() {
-    //     assert_eq!(
-    //         socketaddr_to_multiaddr(
-    //             &SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345,),
-    //             hex_to_cow("ACD1E533EC271FCDE0275947F4D62A2B2331FF10C9DDE0298EB7B399B4BFF60B"),
-    //         ),
-    //         "/ip4/127.0.0.1/udp/12345/x-webrtc/ACD1E533EC271FCDE0275947F4D62A2B2331FF10C9DDE0298EB7B399B4BFF60B"
-    //             .parse::<Multiaddr>()
-    //             .unwrap()
-    //     );
-    // }
 
     #[tokio::test]
     async fn dialer_connects_to_listener_ipv4() {
