@@ -20,6 +20,7 @@ futures = "0.3.17"
 futures-rustls = "0.22"
 hex = "0.4"
 libp2p-core = { version = "0.32.0", default-features = false, git = "https://github.com/melekes/rust-libp2p", branch = "anton/x-webrtc"  }
+libp2p-noise = { version = "0.35.0", git = "https://github.com/melekes/rust-libp2p", branch = "anton/x-webrtc" }
 log = "0.4.14"
 quicksink = "0.1"
 rcgen = "0.8.14"
