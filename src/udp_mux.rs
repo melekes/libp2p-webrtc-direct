@@ -370,7 +370,9 @@ fn hex_to_cow<'a>(s: &str) -> Cow<'a, [u8; 32]> {
     Cow::Owned(buf)
 }
 
-fn ufrag_from_stun_message(buffer: &[u8], first: bool) -> Result<String, Error> {
+/// Gets the ufrag from the given STUN message or returns an error, if failed to decode or the
+/// username attribute is not present.
+fn ufrag_from_stun_message(buffer: &[u8], local_ufrag: bool) -> Result<String, Error> {
     let (result, message) = {
         let mut m = STUNMessage::new();
 
@@ -396,7 +398,8 @@ fn ufrag_from_stun_message(buffer: &[u8], first: bool) -> Result<String, Error> 
                     err
                 ))),
                 Ok(s) => {
-                    let res = if first {
+                    // s is a combination of the local_ufrag and the remote ufrag separated by `:`.
+                    let res = if local_ufrag {
                         s.split(":").next()
                     } else {
                         s.split(":").last()
