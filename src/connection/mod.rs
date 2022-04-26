@@ -39,20 +39,13 @@ pub struct Connection<'a> {
     pub inner: RTCPeerConnection,
     /// A data channel.
     pub data_channel: PollDataChannel<'a>,
-    /// Peer ID
-    pub peer_id: PeerId,
 }
 
 impl Connection<'_> {
-    pub fn new(
-        peer_conn: RTCPeerConnection,
-        data_channel: Arc<DataChannel>,
-        peer_id: PeerId,
-    ) -> Self {
+    pub fn new(peer_conn: RTCPeerConnection, data_channel: Arc<DataChannel>) -> Self {
         Self {
             inner: peer_conn,
             data_channel: PollDataChannel::new(data_channel),
-            peer_id,
         }
     }
 }

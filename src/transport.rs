@@ -93,9 +93,6 @@ pub struct WebRTCDirectTransport {
 
     /// The receiver for new `SocketAddr` connecting to this peer.
     new_addr_rx: Arc<Mutex<mpsc::Receiver<Multiaddr>>>,
-
-    /// `Keypair` identifying this peer
-    id_keys: identity::Keypair,
 }
 
 impl WebRTCDirectTransport {
@@ -104,7 +101,6 @@ impl WebRTCDirectTransport {
     /// Creates a UDP socket bound to `listen_addr`.
     pub async fn new<A: ToSocketAddrs>(
         certificate: RTCCertificate,
-        id_keys: identity::Keypair,
         listen_addr: A,
     ) -> Result<Self, TransportError<Error>> {
         // bind to `listen_addr` and construct a UDP mux.
@@ -128,7 +124,6 @@ impl WebRTCDirectTransport {
             udp_mux,
             udp_mux_addr,
             new_addr_rx: Arc::new(Mutex::new(new_addr_rx)),
-            id_keys,
         })
     }
 
@@ -153,7 +148,6 @@ impl Transport for WebRTCDirectTransport {
             self.config.clone(),
             self.udp_mux.clone(),
             self.new_addr_rx.clone(),
-            self.id_keys.clone(),
         ))
     }
 
@@ -196,8 +190,6 @@ pub struct WebRTCListenStream {
     udp_mux: Arc<dyn UDPMux + Send + Sync>,
     /// The receiver for new `SocketAddr` connecting to this peer.
     new_addr_rx: Arc<Mutex<mpsc::Receiver<Multiaddr>>>,
-    /// `Keypair` identifying this peer.
-    id_keys: identity::Keypair,
 }
 
 impl WebRTCListenStream {
@@ -208,7 +200,6 @@ impl WebRTCListenStream {
         config: RTCConfiguration,
         udp_mux: Arc<dyn UDPMux + Send + Sync>,
         new_addr_rx: Arc<Mutex<mpsc::Receiver<Multiaddr>>>,
-        id_keys: identity::Keypair,
     ) -> Self {
         // Check whether the listening IP is set or not.
         let in_addr = if match &listen_addr {
@@ -234,7 +225,6 @@ impl WebRTCListenStream {
             config,
             udp_mux,
             new_addr_rx,
-            id_keys,
         }
     }
 }
@@ -337,7 +327,6 @@ impl Stream for WebRTCListenStream {
                         me.udp_mux.clone(),
                         me.config.clone(),
                         addr,
-                        me.id_keys.clone(),
                     )) as BoxFuture<'static, _>,
                 }))),
                 Poll::Ready(None) => Poll::Ready(None),
@@ -440,38 +429,13 @@ impl WebRTCDirectTransport {
             .await?;
 
         // wait until data channel is opened and ready to use
-        let data_channel =
-            match tokio_crate::time::timeout(Duration::from_secs(10), data_channel_tx).await {
-                Ok(Ok(dc)) => dc,
-                Ok(Err(e)) => return Err(Error::InternalError(e.to_string())),
-                Err(_) => {
-                    return Err(Error::InternalError(
-                        "data channel opening took longer than 10 seconds (see logs)".into(),
-                    ))
-                },
-            };
-
-        trace!("noise handshake with {}", remote);
-        let id_keys = identity::Keypair::generate_ed25519();
-        let dh_keys = Keypair::<X25519Spec>::new()
-            .into_authentic(&id_keys)
-            .unwrap();
-        let noise = NoiseConfig::xx(dh_keys);
-        let info = noise.protocol_info().next().unwrap();
-        // after noise is successful and we've authenticated the remote peer, encrypted IO is no
-        // longer needed, hence ignored here.
-        let (peer_id, _) = noise
-            .upgrade_outbound(PollDataChannel::new(data_channel.clone()), info)
-            .and_then(|(remote, io)| match remote {
-                RemoteIdentity::IdentityKey(pk) => future::ok((pk.to_peer_id(), io)),
-                _ => future::err(NoiseError::AuthenticationFailed),
-            })
-            .await
-            .map_err(Error::Noise)?;
-
-        // TODO: assert_eq!(peer_id, peer_id from Multiaddr)
-
-        Ok(Connection::new(peer_connection, data_channel, peer_id))
+        match tokio_crate::time::timeout(Duration::from_secs(10), data_channel_tx).await {
+            Ok(Ok(dc)) => Ok(Connection::new(peer_connection, dc)),
+            Ok(Err(e)) => Err(Error::InternalError(e.to_string())),
+            Err(_) => Err(Error::InternalError(
+                "data channel opening took longer than 10 seconds (see logs)".into(),
+            )),
+        }
     }
 }
 
@@ -686,8 +650,7 @@ mod tests {
         let transport = {
             let kp = KeyPair::generate(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key pair");
             let cert = RTCCertificate::from_key_pair(kp).expect("certificate");
-            let id_keys = identity::Keypair::generate_ed25519();
-            WebRTCDirectTransport::new(cert, id_keys, listen_addr)
+            WebRTCDirectTransport::new(cert, listen_addr)
                 .await
                 .expect("transport")
         };
@@ -720,9 +683,8 @@ mod tests {
         let transport2 = {
             let kp = KeyPair::generate(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key pair");
             let cert = RTCCertificate::from_key_pair(kp).expect("certificate");
-            let id_keys = identity::Keypair::generate_ed25519();
             // okay to reuse `listen_addr` since the port is `0` (any).
-            WebRTCDirectTransport::new(cert, id_keys, listen_addr)
+            WebRTCDirectTransport::new(cert, listen_addr)
                 .await
                 .expect("transport")
         };

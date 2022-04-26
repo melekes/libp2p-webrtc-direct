@@ -49,7 +49,6 @@ impl WebRTCUpgrade {
         udp_mux: Arc<dyn UDPMux + Send + Sync>,
         config: RTCConfiguration,
         addr: Multiaddr,
-        id_keys: identity::Keypair,
     ) -> Result<Connection<'static>, Error> {
         trace!("upgrading {}", addr);
 
@@ -134,36 +133,12 @@ impl WebRTCUpgrade {
         peer_connection.set_local_description(answer).await?;
 
         // wait until data channel is opened and ready to use
-        let data_channel =
-            match tokio_crate::time::timeout(Duration::from_secs(10), data_channel_tx).await {
-                Ok(Ok(dc)) => dc,
-                Ok(Err(e)) => return Err(Error::InternalError(e.to_string())),
-                Err(_) => {
-                    return Err(Error::InternalError(
-                        "data channel opening took longer than 10 seconds (see logs)".into(),
-                    ))
-                },
-            };
-
-        trace!("noise handshake with {}", addr);
-        let dh_keys = Keypair::<X25519Spec>::new()
-            .into_authentic(&id_keys)
-            .unwrap();
-        let noise = NoiseConfig::xx(dh_keys);
-        let info = noise.protocol_info().next().unwrap();
-        // after noise is successful and we've authenticated the remote peer, encrypted IO is no
-        // longer needed, hence ignored here.
-        let (peer_id, _) = noise
-            .upgrade_inbound(PollDataChannel::new(data_channel.clone()), info)
-            .and_then(|(remote, io)| match remote {
-                RemoteIdentity::IdentityKey(pk) => future::ok((pk.to_peer_id(), io)),
-                _ => future::err(NoiseError::AuthenticationFailed),
-            })
-            .await
-            .map_err(Error::Noise)?;
-
-        // TODO: assert_eq!(peer_id, peer_id from Multiaddr)
-
-        Ok(Connection::new(peer_connection, data_channel, peer_id))
+        match tokio_crate::time::timeout(Duration::from_secs(10), data_channel_tx).await {
+            Ok(Ok(dc)) => Ok(Connection::new(peer_connection, dc)),
+            Ok(Err(e)) => Err(Error::InternalError(e.to_string())),
+            Err(_) => Err(Error::InternalError(
+                "data channel opening took longer than 10 seconds (see logs)".into(),
+            )),
+        }
     }
 }
