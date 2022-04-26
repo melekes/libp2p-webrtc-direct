@@ -30,7 +30,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use poll_data_channel::PollDataChannel;
+pub(crate) use poll_data_channel::PollDataChannel;
 
 /// A WebRTC connection over a single data channel. See lib documentation for
 /// the reasoning as to why a single data channel is being used.

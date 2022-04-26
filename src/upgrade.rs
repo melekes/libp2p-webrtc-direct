@@ -37,7 +37,7 @@ use webrtc_ice::udp_mux::UDPMux;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::connection::Connection;
+use crate::connection::{Connection, PollDataChannel};
 use crate::error::Error;
 use crate::sdp;
 use crate::transport;
@@ -144,7 +144,7 @@ impl WebRTCUpgrade {
                 },
             };
 
-        // noise handshake
+        trace!("noise handshake with {}", addr);
         let id_keys = identity::Keypair::generate_ed25519();
         let dh_keys = Keypair::<X25519Spec>::new()
             .into_authentic(&id_keys)
@@ -152,8 +152,12 @@ impl WebRTCUpgrade {
         let noise = NoiseConfig::xx(dh_keys);
         // after noise is successful and we've authenticated the remote peer, encrypted IO is no
         // longer needed, hence ignored here.
+        let info = noise.protocol_info().next().unwrap();
         let (peer_id, _) = noise
-            .upgrade_inbound(data_channel, noise.protocol_info().next().unwrap())
+            .upgrade_inbound(
+                PollDataChannel::new(data_channel.clone()),
+                info,
+            )
             .and_then(|(remote, io)| match remote {
                 RemoteIdentity::IdentityKey(pk) => future::ok((pk.to_peer_id(), io)),
                 _ => future::err(NoiseError::AuthenticationFailed),

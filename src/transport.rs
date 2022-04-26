@@ -60,7 +60,7 @@ use std::time::Duration;
 use crate::error::Error;
 use crate::sdp;
 
-use crate::connection::Connection;
+use crate::connection::{Connection, PollDataChannel};
 use crate::udp_mux::UDPMuxNewAddr;
 use crate::udp_mux::UDPMuxParams;
 use crate::upgrade::WebRTCUpgrade;
@@ -427,7 +427,7 @@ impl WebRTCDirectTransport {
                 },
             };
 
-        // noise handshake
+        trace!("noise handshake with {}", remote);
         let id_keys = identity::Keypair::generate_ed25519();
         let dh_keys = Keypair::<X25519Spec>::new()
             .into_authentic(&id_keys)
@@ -435,8 +435,9 @@ impl WebRTCDirectTransport {
         let noise = NoiseConfig::xx(dh_keys);
         // after noise is successful and we've authenticated the remote peer, encrypted IO is no
         // longer needed, hence ignored here.
+        let info = noise.protocol_info().next().unwrap();
         let (peer_id, _) = noise
-            .upgrade_outbound(data_channel, noise.protocol_info().next().unwrap())
+            .upgrade_outbound(PollDataChannel::new(data_channel.clone()), info)
             .and_then(|(remote, io)| match remote {
                 RemoteIdentity::IdentityKey(pk) => future::ok((pk.to_peer_id(), io)),
                 _ => future::err(NoiseError::AuthenticationFailed),
