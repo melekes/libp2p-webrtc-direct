@@ -93,6 +93,9 @@ pub struct WebRTCDirectTransport {
 
     /// The receiver for new `SocketAddr` connecting to this peer.
     new_addr_rx: Arc<Mutex<mpsc::Receiver<Multiaddr>>>,
+
+    /// `Keypair` identifying this peer
+    id_keys: identity::Keypair,
 }
 
 impl WebRTCDirectTransport {
@@ -101,6 +104,7 @@ impl WebRTCDirectTransport {
     /// Creates a UDP socket bound to `listen_addr`.
     pub async fn new<A: ToSocketAddrs>(
         certificate: RTCCertificate,
+        id_keys: identity::Keypair,
         listen_addr: A,
     ) -> Result<Self, TransportError<Error>> {
         // bind to `listen_addr` and construct a UDP mux.
@@ -124,6 +128,7 @@ impl WebRTCDirectTransport {
             udp_mux,
             udp_mux_addr,
             new_addr_rx: Arc::new(Mutex::new(new_addr_rx)),
+            id_keys,
         })
     }
 
@@ -148,6 +153,7 @@ impl Transport for WebRTCDirectTransport {
             self.config.clone(),
             self.udp_mux.clone(),
             self.new_addr_rx.clone(),
+            self.id_keys.clone(),
         ))
     }
 
@@ -190,6 +196,8 @@ pub struct WebRTCListenStream {
     udp_mux: Arc<dyn UDPMux + Send + Sync>,
     /// The receiver for new `SocketAddr` connecting to this peer.
     new_addr_rx: Arc<Mutex<mpsc::Receiver<Multiaddr>>>,
+    /// `Keypair` identifying this peer.
+    id_keys: identity::Keypair,
 }
 
 impl WebRTCListenStream {
@@ -200,6 +208,7 @@ impl WebRTCListenStream {
         config: RTCConfiguration,
         udp_mux: Arc<dyn UDPMux + Send + Sync>,
         new_addr_rx: Arc<Mutex<mpsc::Receiver<Multiaddr>>>,
+        id_keys: identity::Keypair,
     ) -> Self {
         // Check whether the listening IP is set or not.
         let in_addr = if match &listen_addr {
@@ -225,6 +234,7 @@ impl WebRTCListenStream {
             config,
             udp_mux,
             new_addr_rx,
+            id_keys,
         }
     }
 }
@@ -327,6 +337,7 @@ impl Stream for WebRTCListenStream {
                         me.udp_mux.clone(),
                         me.config.clone(),
                         addr,
+                        me.id_keys.clone(),
                     )) as BoxFuture<'static, _>,
                 }))),
                 Poll::Ready(None) => Poll::Ready(None),
@@ -457,6 +468,8 @@ impl WebRTCDirectTransport {
             })
             .await
             .map_err(Error::Noise)?;
+
+        // TODO: assert_eq!(peer_id, peer_id from Multiaddr)
 
         Ok(Connection::new(peer_connection, data_channel, peer_id))
     }
@@ -673,7 +686,8 @@ mod tests {
         let transport = {
             let kp = KeyPair::generate(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key pair");
             let cert = RTCCertificate::from_key_pair(kp).expect("certificate");
-            WebRTCDirectTransport::new(cert, listen_addr)
+            let id_keys = identity::Keypair::generate_ed25519();
+            WebRTCDirectTransport::new(cert, id_keys, listen_addr)
                 .await
                 .expect("transport")
         };
@@ -706,8 +720,9 @@ mod tests {
         let transport2 = {
             let kp = KeyPair::generate(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key pair");
             let cert = RTCCertificate::from_key_pair(kp).expect("certificate");
+            let id_keys = identity::Keypair::generate_ed25519();
             // okay to reuse `listen_addr` since the port is `0` (any).
-            WebRTCDirectTransport::new(cert, listen_addr)
+            WebRTCDirectTransport::new(cert, id_keys, listen_addr)
                 .await
                 .expect("transport")
         };

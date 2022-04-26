@@ -49,6 +49,7 @@ impl WebRTCUpgrade {
         udp_mux: Arc<dyn UDPMux + Send + Sync>,
         config: RTCConfiguration,
         addr: Multiaddr,
+        id_keys: identity::Keypair,
     ) -> Result<Connection<'static>, Error> {
         trace!("upgrading {}", addr);
 
@@ -145,7 +146,6 @@ impl WebRTCUpgrade {
             };
 
         trace!("noise handshake with {}", addr);
-        let id_keys = identity::Keypair::generate_ed25519();
         let dh_keys = Keypair::<X25519Spec>::new()
             .into_authentic(&id_keys)
             .unwrap();
@@ -161,6 +161,8 @@ impl WebRTCUpgrade {
             })
             .await
             .map_err(Error::Noise)?;
+
+        // TODO: assert_eq!(peer_id, peer_id from Multiaddr)
 
         Ok(Connection::new(peer_connection, data_channel, peer_id))
     }
