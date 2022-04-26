@@ -40,6 +40,7 @@ use tinytemplate::TinyTemplate;
 use tokio_crate::net::{ToSocketAddrs, UdpSocket};
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
+use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::peer_connection::certificate::RTCCertificate;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
@@ -358,7 +359,19 @@ impl WebRTCDirectTransport {
             .await?;
 
         // Create a datachannel with label 'data'
-        let data_channel = peer_connection.create_data_channel("data", None).await?;
+        let data_channel = peer_connection
+            .create_data_channel(
+                "data",
+                Some(RTCDataChannelInit {
+                    negotiated: None,
+                    id: Some(1),
+                    ordered: None,
+                    max_retransmits: None,
+                    max_packet_life_time: None,
+                    protocol: None,
+                }),
+            )
+            .await?;
 
         let (data_channel_rx, data_channel_tx) = oneshot::channel::<Arc<DetachedDataChannel>>();
 
@@ -433,9 +446,9 @@ impl WebRTCDirectTransport {
             .into_authentic(&id_keys)
             .unwrap();
         let noise = NoiseConfig::xx(dh_keys);
+        let info = noise.protocol_info().next().unwrap();
         // after noise is successful and we've authenticated the remote peer, encrypted IO is no
         // longer needed, hence ignored here.
-        let info = noise.protocol_info().next().unwrap();
         let (peer_id, _) = noise
             .upgrade_outbound(PollDataChannel::new(data_channel.clone()), info)
             .and_then(|(remote, io)| match remote {

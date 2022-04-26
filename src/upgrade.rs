@@ -76,7 +76,7 @@ impl WebRTCUpgrade {
                 "data",
                 Some(RTCDataChannelInit {
                     negotiated: Some(true),
-                    id: Some(0),
+                    id: Some(1),
                     ordered: None,
                     max_retransmits: None,
                     max_packet_life_time: None,
@@ -150,14 +150,11 @@ impl WebRTCUpgrade {
             .into_authentic(&id_keys)
             .unwrap();
         let noise = NoiseConfig::xx(dh_keys);
+        let info = noise.protocol_info().next().unwrap();
         // after noise is successful and we've authenticated the remote peer, encrypted IO is no
         // longer needed, hence ignored here.
-        let info = noise.protocol_info().next().unwrap();
         let (peer_id, _) = noise
-            .upgrade_inbound(
-                PollDataChannel::new(data_channel.clone()),
-                info,
-            )
+            .upgrade_inbound(PollDataChannel::new(data_channel.clone()), info)
             .and_then(|(remote, io)| match remote {
                 RemoteIdentity::IdentityKey(pk) => future::ok((pk.to_peer_id(), io)),
                 _ => future::err(NoiseError::AuthenticationFailed),
