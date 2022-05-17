@@ -28,7 +28,7 @@ use futures::{
     channel::{mpsc, oneshot},
     future::BoxFuture,
     prelude::*,
-    ready, TryFutureExt,
+    ready, select, TryFutureExt,
 };
 use futures_timer::Delay;
 use if_watch::{IfEvent, IfWatcher};
@@ -61,7 +61,7 @@ use crate::sdp;
 use crate::connection::Connection;
 use crate::udp_mux::UDPMuxNewAddr;
 use crate::udp_mux::UDPMuxParams;
-use crate::upgrade::WebRTCUpgrade;
+use crate::upgrade;
 
 enum IfWatch {
     Pending(BoxFuture<'static, io::Result<IfWatcher>>),
@@ -100,12 +100,12 @@ impl WebRTCDirectTransport {
         certificate: RTCCertificate,
         listen_addr: A,
     ) -> Result<Self, TransportError<Error>> {
-        // bind to `listen_addr` and construct a UDP mux.
+        // Bind to `listen_addr` and construct a UDP mux.
         let socket = UdpSocket::bind(listen_addr)
             .map_err(Error::IoError)
             .map_err(TransportError::Other)
             .await?;
-        // sender and receiver for new addresses
+        // Sender and receiver for new addresses
         let (new_addr_tx, new_addr_rx) = mpsc::channel(1);
         let udp_mux_addr = socket
             .local_addr()
@@ -315,16 +315,13 @@ impl Stream for WebRTCListenStream {
                 }
             }
 
-            // safe to unwrap here since this is the only place `new_addr_rx` is locked.
+            // Safe to unwrap here since this is the only place `new_addr_rx` is locked.
             return match Pin::new(&mut *me.new_addr_rx.lock().unwrap()).poll_next(cx) {
                 Poll::Ready(Some(addr)) => Poll::Ready(Some(Ok(ListenerEvent::Upgrade {
                     local_addr: ip_to_multiaddr(me.listen_addr.ip(), me.listen_addr.port()),
                     remote_addr: addr.clone(),
-                    upgrade: Box::pin(WebRTCUpgrade::new(
-                        me.udp_mux.clone(),
-                        me.config.clone(),
-                        addr,
-                    )) as BoxFuture<'static, _>,
+                    upgrade: Box::pin(upgrade::webrtc(me.udp_mux.clone(), me.config.clone(), addr))
+                        as BoxFuture<'static, _>,
                 }))),
                 Poll::Ready(None) => Poll::Ready(None),
                 Poll::Pending => Poll::Pending,
@@ -370,28 +367,34 @@ impl WebRTCDirectTransport {
             )
             .await?;
 
-        let (data_channel_rx, data_channel_tx) = oneshot::channel::<Arc<DetachedDataChannel>>();
+        let (data_channel_rx, mut data_channel_tx) = oneshot::channel::<Arc<DetachedDataChannel>>();
 
         // Wait until the data channel is opened and detach it.
-        let d = Arc::clone(&data_channel);
         data_channel
-            .on_open(Box::new(move || {
-                debug!("Data channel '{}'-'{}' open.", d.label(), d.id());
+            .on_open({
+                let data_channel = data_channel.clone();
+                Box::new(move || {
+                    debug!(
+                        "Data channel '{}'-'{}' open.",
+                        data_channel.label(),
+                        data_channel.id()
+                    );
 
-                let d2 = Arc::clone(&d);
-                Box::pin(async move {
-                    match d2.detach().await {
-                        Ok(detached) => {
-                            if let Err(_) = data_channel_rx.send(detached) {
-                                error!("data_channel_tx dropped");
-                            }
-                        },
-                        Err(e) => {
-                            error!("Can't detach data channel: {}", e);
-                        },
-                    };
+                    Box::pin(async move {
+                        let data_channel = data_channel.clone();
+                        match data_channel.detach().await {
+                            Ok(detached) => {
+                                if let Err(_) = data_channel_rx.send(detached) {
+                                    error!("data_channel_tx dropped");
+                                }
+                            },
+                            Err(e) => {
+                                error!("Can't detach data channel: {}", e);
+                            },
+                        };
+                    })
                 })
-            }))
+            })
             .await;
 
         let offer = peer_connection
@@ -425,13 +428,15 @@ impl WebRTCDirectTransport {
             .map_err(Error::WebRTC)
             .await?;
 
-        // wait until data channel is opened and ready to use
-        match tokio_crate::time::timeout(Duration::from_secs(10), data_channel_tx).await {
-            Ok(Ok(dc)) => Ok(Connection::new(peer_connection, dc)),
-            Ok(Err(e)) => Err(Error::InternalError(e.to_string())),
-            Err(_) => Err(Error::InternalError(
+        // Wait until data channel is opened and ready to use
+        select! {
+            res = data_channel_tx => match res {
+                Ok(dc) => Ok(Connection::new(peer_connection, dc)),
+                Err(e) => Err(Error::InternalError(e.to_string())),
+            },
+            _ = Delay::new(Duration::from_secs(10)).fuse() => Err(Error::InternalError(
                 "data channel opening took longer than 10 seconds (see logs)".into(),
-            )),
+            ))
         }
     }
 }
@@ -457,7 +462,7 @@ pub(crate) fn render_description(description: &str, addr: SocketAddr, fingerprin
         },
         target_ip: addr.ip(),
         target_port: addr.port(),
-        // hashing algorithm (SHA-256) is hardcoded for now
+        // Hashing algorithm (SHA-256) is hardcoded for now
         fingerprint: fingerprint.to_owned(),
         // ufrag and pwd are both equal to the fingerprint (minus the `:` delimiter)
         ufrag: f.clone(),

@@ -21,6 +21,7 @@
 use bytes::Bytes;
 
 use futures::prelude::*;
+use futures::ready;
 use webrtc_data::data_channel::DataChannel;
 use webrtc_data::Error;
 
@@ -34,16 +35,16 @@ use std::task::{Context, Poll};
 const DEFAULT_READ_BUF_SIZE: usize = 4096;
 
 /// State of the read `Future` in [`PollStream`].
-enum ReadFut<'a> {
+enum ReadFut {
     /// Nothing in progress.
     Idle,
     /// Reading data from the underlying stream.
-    Reading(Pin<Box<dyn Future<Output = Result<Vec<u8>, Error>> + Send + 'a>>),
+    Reading(Pin<Box<dyn Future<Output = Result<Vec<u8>, Error>> + Send + 'static>>),
     /// Finished reading, but there's unread data in the temporary buffer.
     RemainingData(Vec<u8>),
 }
 
-impl<'a> ReadFut<'a> {
+impl ReadFut {
     /// Gets a mutable reference to the future stored inside `Reading(future)`.
     ///
     /// # Panics
@@ -51,7 +52,7 @@ impl<'a> ReadFut<'a> {
     /// Panics if `ReadFut` variant is not `Reading`.
     fn get_reading_mut(
         &mut self,
-    ) -> &mut Pin<Box<dyn Future<Output = Result<Vec<u8>, Error>> + Send + 'a>> {
+    ) -> &mut Pin<Box<dyn Future<Output = Result<Vec<u8>, Error>> + Send + 'static>> {
         match self {
             ReadFut::Reading(ref mut fut) => fut,
             _ => panic!("expected ReadFut to be Reading"),
@@ -67,7 +68,7 @@ impl<'a> ReadFut<'a> {
 pub struct PollDataChannel<'a> {
     data_channel: Arc<DataChannel>,
 
-    read_fut: ReadFut<'a>,
+    read_fut: ReadFut,
     write_fut: Option<Pin<Box<dyn Future<Output = Result<usize, Error>> + Send + 'a>>>,
     shutdown_fut: Option<Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>>,
 
@@ -75,7 +76,7 @@ pub struct PollDataChannel<'a> {
 }
 
 impl PollDataChannel<'_> {
-    /// Constructs a new `PollDataChannel`.
+    /// Constructs a new [`PollDataChannel`].
     pub fn new(data_channel: Arc<DataChannel>) -> Self {
         Self {
             data_channel,
@@ -110,19 +111,15 @@ impl AsyncRead for PollDataChannel<'_> {
     ) -> Poll<io::Result<usize>> {
         let fut = match self.read_fut {
             ReadFut::Idle => {
-                // read into a temporary buffer because `buf` has an unonymous lifetime, which can
+                // Read into a temporary buffer because `buf` has an anonymous lifetime, which can
                 // be shorter than the lifetime of `read_fut`.
                 let dc = self.data_channel.clone();
                 let mut temp_buf = vec![0; self.read_buf_cap];
                 self.read_fut = ReadFut::Reading(Box::pin(async move {
-                    let res = dc.read(temp_buf.as_mut_slice()).await;
-                    match res {
-                        Ok(n) => {
-                            temp_buf.truncate(n);
-                            Ok(temp_buf)
-                        },
-                        Err(e) => Err(e),
-                    }
+                    dc.read(temp_buf.as_mut_slice()).await.map(|n| {
+                        temp_buf.truncate(n);
+                        temp_buf
+                    })
                 }));
                 self.read_fut.get_reading_mut()
             },
@@ -142,21 +139,20 @@ impl AsyncRead for PollDataChannel<'_> {
         };
 
         loop {
-            match fut.as_mut().poll(cx) {
-                Poll::Pending => return Poll::Pending,
-                // retry immediately upon empty data or incomplete chunks
+            match ready!(fut.as_mut().poll(cx)) {
+                // Retry immediately upon empty data or incomplete chunks
                 // since there's no way to setup a waker.
-                Poll::Ready(Err(Error::Sctp(webrtc_sctp::Error::ErrTryAgain))) => {},
+                Err(Error::Sctp(webrtc_sctp::Error::ErrTryAgain)) => {},
                 // EOF has been reached => don't touch buf and just return Ok
-                Poll::Ready(Err(Error::Sctp(webrtc_sctp::Error::ErrEof))) => {
+                Err(Error::Sctp(webrtc_sctp::Error::ErrEof)) => {
                     self.read_fut = ReadFut::Idle;
                     return Poll::Ready(Ok(0));
                 },
-                Poll::Ready(Err(e)) => {
+                Err(e) => {
                     self.read_fut = ReadFut::Idle;
                     return Poll::Ready(Err(webrtc_error_to_io(e)));
                 },
-                Poll::Ready(Ok(mut temp_buf)) => {
+                Ok(mut temp_buf) => {
                     let remaining = buf.len();
                     let len = std::cmp::min(temp_buf.len(), remaining);
                     buf.copy_from_slice(&temp_buf[..len]);
@@ -223,13 +219,12 @@ impl AsyncWrite for PollDataChannel<'_> {
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.write_fut.as_mut() {
-            Some(fut) => match fut.as_mut().poll(cx) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(Err(e)) => {
+            Some(fut) => match ready!(fut.as_mut().poll(cx)) {
+                Err(e) => {
                     self.write_fut = None;
                     Poll::Ready(Err(webrtc_error_to_io(e)))
                 },
-                Poll::Ready(Ok(_)) => {
+                Ok(_) => {
                     self.write_fut = None;
                     Poll::Ready(Ok(()))
                 },
@@ -239,19 +234,14 @@ impl AsyncWrite for PollDataChannel<'_> {
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let fut = match self.shutdown_fut.as_mut() {
-            Some(fut) => fut,
-            None => {
-                let dc = self.data_channel.clone();
-                self.shutdown_fut
-                    .get_or_insert(Box::pin(async move { dc.close().await }))
-            },
-        };
+        let dc = self.data_channel.clone();
+        let fut = self
+            .shutdown_fut
+            .get_or_insert_with(|| Box::pin(async move { dc.close().await }));
 
-        match fut.as_mut().poll(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(e)) => Poll::Ready(Err(webrtc_error_to_io(e))),
-            Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
+        match ready!(fut.as_mut().poll(cx)) {
+            Err(e) => Poll::Ready(Err(webrtc_error_to_io(e))),
+            Ok(_) => Poll::Ready(Ok(())),
         }
     }
 }

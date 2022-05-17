@@ -1162,6 +1162,7 @@ dependencies = [
  "tokio",
  "webrtc",
  "webrtc-data",
+ "webrtc-ice",
  "webrtc-sctp",
  "webrtc-util",
 ]
