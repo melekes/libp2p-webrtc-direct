@@ -39,7 +39,7 @@ enum ReadFut {
     /// Nothing in progress.
     Idle,
     /// Reading data from the underlying stream.
-    Reading(Pin<Box<dyn Future<Output = Result<Vec<u8>, Error>> + Send + 'static>>),
+    Reading(Pin<Box<dyn Future<Output = Result<Vec<u8>, Error>> + Send>>),
     /// Finished reading, but there's unread data in the temporary buffer.
     RemainingData(Vec<u8>),
 }
@@ -52,7 +52,7 @@ impl ReadFut {
     /// Panics if `ReadFut` variant is not `Reading`.
     fn get_reading_mut(
         &mut self,
-    ) -> &mut Pin<Box<dyn Future<Output = Result<Vec<u8>, Error>> + Send + 'static>> {
+    ) -> &mut Pin<Box<dyn Future<Output = Result<Vec<u8>, Error>> + Send>> {
         match self {
             ReadFut::Reading(ref mut fut) => fut,
             _ => panic!("expected ReadFut to be Reading"),
@@ -234,10 +234,14 @@ impl AsyncWrite for PollDataChannel<'_> {
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let dc = self.data_channel.clone();
-        let fut = self
-            .shutdown_fut
-            .get_or_insert_with(|| Box::pin(async move { dc.close().await }));
+        let fut = match self.shutdown_fut.as_mut() {
+            Some(fut) => fut,
+            None => {
+                let data_channel = self.data_channel.clone();
+                self.shutdown_fut
+                    .get_or_insert(Box::pin(async move { data_channel.close().await }))
+            },
+        };
 
         match ready!(fut.as_mut().poll(cx)) {
             Err(e) => Poll::Ready(Err(webrtc_error_to_io(e))),
