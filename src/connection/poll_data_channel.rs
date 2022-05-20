@@ -65,17 +65,17 @@ impl ReadFut {
 ///
 /// Both `poll_read` and `poll_write` calls allocate temporary buffers, which results in an
 /// additional overhead.
-pub struct PollDataChannel<'a> {
+pub struct PollDataChannel {
     data_channel: Arc<DataChannel>,
 
     read_fut: ReadFut,
-    write_fut: Option<Pin<Box<dyn Future<Output = Result<usize, Error>> + Send + 'a>>>,
-    shutdown_fut: Option<Pin<Box<dyn Future<Output = Result<(), Error>> + Send + 'a>>>,
+    write_fut: Option<Pin<Box<dyn Future<Output = Result<usize, Error>> + Send>>>,
+    shutdown_fut: Option<Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>>,
 
     read_buf_cap: usize,
 }
 
-impl PollDataChannel<'_> {
+impl PollDataChannel {
     /// Constructs a new [`PollDataChannel`].
     pub fn new(data_channel: Arc<DataChannel>) -> Self {
         Self {
@@ -103,7 +103,7 @@ impl PollDataChannel<'_> {
     }
 }
 
-impl AsyncRead for PollDataChannel<'_> {
+impl AsyncRead for PollDataChannel {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -169,7 +169,7 @@ impl AsyncRead for PollDataChannel<'_> {
     }
 }
 
-impl AsyncWrite for PollDataChannel<'_> {
+impl AsyncWrite for PollDataChannel {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -250,13 +250,13 @@ impl AsyncWrite for PollDataChannel<'_> {
     }
 }
 
-impl<'a> Clone for PollDataChannel<'a> {
-    fn clone(&self) -> PollDataChannel<'a> {
+impl Clone for PollDataChannel {
+    fn clone(&self) -> PollDataChannel {
         PollDataChannel::new(self.clone_inner())
     }
 }
 
-impl fmt::Debug for PollDataChannel<'_> {
+impl fmt::Debug for PollDataChannel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PollDataChannel")
             .field("data_channel", &self.data_channel)
@@ -264,7 +264,7 @@ impl fmt::Debug for PollDataChannel<'_> {
     }
 }
 
-impl AsRef<DataChannel> for PollDataChannel<'_> {
+impl AsRef<DataChannel> for PollDataChannel {
     fn as_ref(&self) -> &DataChannel {
         &*self.data_channel
     }

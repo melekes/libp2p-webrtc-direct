@@ -20,59 +20,191 @@
 
 mod poll_data_channel;
 
-use futures::prelude::*;
+use fnv::FnvHashMap;
+use futures::{channel::oneshot, future::BoxFuture, prelude::*};
+use libp2p_core::muxing::{StreamMuxer, StreamMuxerEvent};
+use log::{debug, error};
+use thiserror::Error;
+use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::peer_connection::RTCPeerConnection;
-use webrtc_data::data_channel::DataChannel;
+use webrtc_data::data_channel::DataChannel as DetachedDataChannel;
 
-use std::io;
-use std::pin::Pin;
+use futures::lock::Mutex;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use poll_data_channel::PollDataChannel;
 
-/// A WebRTC connection over a single data channel. See lib documentation for
-/// the reasoning as to why a single data channel is being used.
-pub struct Connection<'a> {
-    /// `RTCPeerConnection` to the remote peer.
-    pub inner: RTCPeerConnection,
-    /// A data channel.
-    pub data_channel: PollDataChannel<'a>,
+/// Error in WebRTC.
+#[derive(Error, Debug)]
+pub enum ConnectionError {
+    #[error("webrtc error: {0}")]
+    WebRTC(#[from] webrtc::Error),
+    #[error("internal error: {0} (see debug logs)")]
+    Internal(String),
 }
 
-impl Connection<'_> {
-    pub fn new(peer_conn: RTCPeerConnection, data_channel: Arc<DataChannel>) -> Self {
+impl From<ConnectionError> for std::io::Error {
+    fn from(err: ConnectionError) -> Self {
+        std::io::Error::new(std::io::ErrorKind::Other, err)
+    }
+}
+
+/// A WebRTC connection over a single data channel. See lib documentation for
+/// the reasoning as to why a single data channel is being used.
+pub struct Connection {
+    inner: Arc<Mutex<ConnectionInner>>,
+}
+
+struct ConnectionInner {
+    /// `RTCPeerConnection` to the remote peer.
+    connection: RTCPeerConnection,
+    /// A map of data channels
+    data_channels: FnvHashMap<u16, PollDataChannel>,
+    /// The next data channel ID
+    next_channel_id: u16,
+}
+
+impl Connection {
+    pub fn new(connection: RTCPeerConnection) -> Self {
         Self {
-            inner: peer_conn,
-            data_channel: PollDataChannel::new(data_channel),
+            inner: Arc::new(Mutex::new(ConnectionInner {
+                connection,
+                data_channels: FnvHashMap::default(),
+                next_channel_id: 0,
+            })),
         }
     }
 }
 
-impl AsyncRead for Connection<'_> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
+impl StreamMuxer for Connection {
+    type Substream = Result<PollDataChannel, Self::Error>;
+    type OutboundSubstream = BoxFuture<'static, Result<PollDataChannel, Self::Error>>;
+    type Error = ConnectionError;
+
+    fn poll_event(
+        &self,
         cx: &mut Context<'_>,
+    ) -> Poll<Result<StreamMuxerEvent<Self::Substream>, Self::Error>> {
+        unimplemented!();
+    }
+
+    fn open_outbound(&self) -> Self::OutboundSubstream {
+        let inner = self.inner.clone();
+        Box::pin(async move {
+            let mut inner = inner.lock().await;
+            // Create a datachannel with label 'data'
+            let data_channel = inner
+                .connection
+                .create_data_channel(
+                    "data",
+                    Some(RTCDataChannelInit {
+                        negotiated: None,
+                        id: Some(inner.next_channel_id),
+                        ordered: None,
+                        max_retransmits: None,
+                        max_packet_life_time: None,
+                        protocol: None,
+                    }),
+                )
+                .map_err(|e| ConnectionError::WebRTC(e))
+                .await?;
+
+            inner.next_channel_id += 1;
+
+            let (data_channel_rx, data_channel_tx) = oneshot::channel::<Arc<DetachedDataChannel>>();
+
+            // Wait until the data channel is opened and detach it.
+            data_channel
+                .on_open({
+                    let data_channel = data_channel.clone();
+                    Box::new(move || {
+                        debug!(
+                            "Data channel '{}'-'{}' open.",
+                            data_channel.label(),
+                            data_channel.id()
+                        );
+
+                        Box::pin(async move {
+                            let data_channel = data_channel.clone();
+                            match data_channel.detach().await {
+                                Ok(detached) => {
+                                    if let Err(_) = data_channel_rx.send(detached) {
+                                        error!("data_channel_tx dropped");
+                                    }
+                                },
+                                Err(e) => {
+                                    error!("Can't detach data channel: {}", e);
+                                },
+                            };
+                        })
+                    })
+                })
+                .await;
+
+            // Wait until data channel is opened and ready to use
+            match data_channel_tx.await {
+                Ok(dc) => Ok(PollDataChannel::new(dc)),
+                Err(e) => Err(ConnectionError::Internal(e.to_string())),
+            }
+        })
+    }
+
+    fn poll_outbound(
+        &self,
+        cx: &mut Context<'_>,
+        s: &mut Self::OutboundSubstream,
+    ) -> Poll<Result<Self::Substream, Self::Error>> {
+        unimplemented!();
+    }
+
+    fn destroy_outbound(&self, substream: Self::OutboundSubstream) {
+        unimplemented!();
+    }
+
+    fn read_substream(
+        &self,
+        cx: &mut Context<'_>,
+        s: &mut Self::Substream,
         buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.data_channel).poll_read(cx, buf)
+    ) -> Poll<Result<usize, Self::Error>> {
+        unimplemented!();
     }
-}
 
-impl AsyncWrite for Connection<'_> {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
+    fn write_substream(
+        &self,
         cx: &mut Context<'_>,
+        s: &mut Self::Substream,
         buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.data_channel).poll_write(cx, buf)
+    ) -> Poll<Result<usize, Self::Error>> {
+        unimplemented!();
     }
 
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.data_channel).poll_flush(cx)
+    fn flush_substream(
+        &self,
+        cx: &mut Context<'_>,
+        s: &mut Self::Substream,
+    ) -> Poll<Result<(), Self::Error>> {
+        unimplemented!();
     }
 
-    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.data_channel).poll_close(cx)
+    fn shutdown_substream(
+        &self,
+        cx: &mut Context<'_>,
+        s: &mut Self::Substream,
+    ) -> Poll<Result<(), Self::Error>> {
+        unimplemented!();
+    }
+
+    fn destroy_substream(&self, s: Self::Substream) {
+        unimplemented!();
+    }
+
+    fn close(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        unimplemented!();
+    }
+
+    fn flush_all(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        unimplemented!();
     }
 }

@@ -24,24 +24,17 @@ use libp2p_core::{
     Transport,
 };
 
-use futures::{
-    channel::{mpsc, oneshot},
-    future::BoxFuture,
-    prelude::*,
-    ready, select, TryFutureExt,
-};
+use futures::{channel::mpsc, future::BoxFuture, prelude::*, ready, TryFutureExt};
 use futures_timer::Delay;
 use if_watch::{IfEvent, IfWatcher};
-use log::{debug, error, trace};
+use log::{debug, trace};
 use tinytemplate::TinyTemplate;
 use tokio_crate::net::{ToSocketAddrs, UdpSocket};
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
-use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::peer_connection::certificate::RTCCertificate;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc_data::data_channel::DataChannel as DetachedDataChannel;
 use webrtc_ice::network_type::NetworkType;
 use webrtc_ice::udp_mux::UDPMux;
 use webrtc_ice::udp_network::UDPNetwork;
@@ -132,7 +125,7 @@ impl WebRTCDirectTransport {
 }
 
 impl Transport for WebRTCDirectTransport {
-    type Output = Connection<'static>;
+    type Output = Connection;
     type Error = Error;
     type Listener = WebRTCListenStream;
     type ListenerUpgrade = BoxFuture<'static, Result<Self::Output, Self::Error>>;
@@ -227,8 +220,7 @@ impl WebRTCListenStream {
 }
 
 impl Stream for WebRTCListenStream {
-    type Item =
-        Result<ListenerEvent<BoxFuture<'static, Result<Connection<'static>, Error>>, Error>, Error>;
+    type Item = Result<ListenerEvent<BoxFuture<'static, Result<Connection, Error>>, Error>, Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         let me = Pin::into_inner(self);
@@ -331,7 +323,7 @@ impl Stream for WebRTCListenStream {
 }
 
 impl WebRTCDirectTransport {
-    async fn do_dial(self, addr: Multiaddr) -> Result<Connection<'static>, Error> {
+    async fn do_dial(self, addr: Multiaddr) -> Result<Connection, Error> {
         let socket_addr =
             multiaddr_to_socketaddr(&addr).ok_or_else(|| Error::InvalidMultiaddr(addr.clone()))?;
         if socket_addr.port() == 0 || socket_addr.ip().is_unspecified() {
@@ -351,51 +343,6 @@ impl WebRTCDirectTransport {
             .new_peer_connection(config)
             .map_err(Error::WebRTC)
             .await?;
-
-        // Create a datachannel with label 'data'
-        let data_channel = peer_connection
-            .create_data_channel(
-                "data",
-                Some(RTCDataChannelInit {
-                    negotiated: None,
-                    id: Some(1),
-                    ordered: None,
-                    max_retransmits: None,
-                    max_packet_life_time: None,
-                    protocol: None,
-                }),
-            )
-            .await?;
-
-        let (data_channel_rx, mut data_channel_tx) = oneshot::channel::<Arc<DetachedDataChannel>>();
-
-        // Wait until the data channel is opened and detach it.
-        data_channel
-            .on_open({
-                let data_channel = data_channel.clone();
-                Box::new(move || {
-                    debug!(
-                        "Data channel '{}'-'{}' open.",
-                        data_channel.label(),
-                        data_channel.id()
-                    );
-
-                    Box::pin(async move {
-                        let data_channel = data_channel.clone();
-                        match data_channel.detach().await {
-                            Ok(detached) => {
-                                if let Err(_) = data_channel_rx.send(detached) {
-                                    error!("data_channel_tx dropped");
-                                }
-                            },
-                            Err(e) => {
-                                error!("Can't detach data channel: {}", e);
-                            },
-                        };
-                    })
-                })
-            })
-            .await;
 
         let offer = peer_connection
             .create_offer(None)
@@ -429,15 +376,7 @@ impl WebRTCDirectTransport {
             .await?;
 
         // Wait until data channel is opened and ready to use
-        select! {
-            res = data_channel_tx => match res {
-                Ok(dc) => Ok(Connection::new(peer_connection, dc)),
-                Err(e) => Err(Error::InternalError(e.to_string())),
-            },
-            _ = Delay::new(Duration::from_secs(10)).fuse() => Err(Error::InternalError(
-                "data channel opening took longer than 10 seconds (see logs)".into(),
-            ))
-        }
+        Ok(Connection::new(peer_connection))
     }
 }
 
