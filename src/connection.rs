@@ -21,19 +21,22 @@
 mod poll_data_channel;
 
 use fnv::FnvHashMap;
-use futures::{channel::oneshot, future::BoxFuture, prelude::*};
+use futures::lock::Mutex;
+use futures::{channel::oneshot, future::BoxFuture, prelude::*, ready};
 use libp2p_core::muxing::{StreamMuxer, StreamMuxerEvent};
-use log::{debug, error};
+use log::{debug, error, trace};
 use thiserror::Error;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc_data::data_channel::DataChannel as DetachedDataChannel;
 
-use futures::lock::Mutex;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use poll_data_channel::PollDataChannel;
+
+pub type SubstreamId = u16;
 
 /// Error in WebRTC.
 #[derive(Error, Debug)]
@@ -60,7 +63,7 @@ struct ConnectionInner {
     /// `RTCPeerConnection` to the remote peer.
     connection: RTCPeerConnection,
     /// A map of data channels
-    data_channels: FnvHashMap<u16, PollDataChannel>,
+    data_channels: FnvHashMap<SubstreamId, PollDataChannel>,
     /// The next data channel ID
     next_channel_id: u16,
 }
@@ -78,8 +81,8 @@ impl Connection {
 }
 
 impl StreamMuxer for Connection {
-    type Substream = Result<PollDataChannel, Self::Error>;
-    type OutboundSubstream = BoxFuture<'static, Result<PollDataChannel, Self::Error>>;
+    type Substream = PollDataChannel;
+    type OutboundSubstream = BoxFuture<'static, Result<SubstreamId, Self::Error>>;
     type Error = ConnectionError;
 
     fn poll_event(
@@ -92,15 +95,18 @@ impl StreamMuxer for Connection {
     fn open_outbound(&self) -> Self::OutboundSubstream {
         let inner = self.inner.clone();
         Box::pin(async move {
-            let mut inner = inner.lock().await;
+            let mut lock = inner.lock().await;
+
+            trace!("Opening outbound substream {}", lock.next_channel_id);
+
             // Create a datachannel with label 'data'
-            let data_channel = inner
+            let data_channel = lock
                 .connection
                 .create_data_channel(
                     "data",
                     Some(RTCDataChannelInit {
                         negotiated: None,
-                        id: Some(inner.next_channel_id),
+                        id: Some(lock.next_channel_id),
                         ordered: None,
                         max_retransmits: None,
                         max_packet_life_time: None,
@@ -110,7 +116,10 @@ impl StreamMuxer for Connection {
                 .map_err(|e| ConnectionError::WebRTC(e))
                 .await?;
 
-            inner.next_channel_id += 1;
+            // Increasing `next_channel_id` here prevents two substreams having the same ID.
+            lock.next_channel_id += 1;
+            // No need to hold the lock for DTLS handshake.
+            drop(lock);
 
             let (data_channel_rx, data_channel_tx) = oneshot::channel::<Arc<DetachedDataChannel>>();
 
@@ -144,7 +153,12 @@ impl StreamMuxer for Connection {
 
             // Wait until data channel is opened and ready to use
             match data_channel_tx.await {
-                Ok(dc) => Ok(PollDataChannel::new(dc)),
+                Ok(dc) => {
+                    let mut lock = inner.lock().await;
+                    lock.data_channels
+                        .insert(data_channel.id(), PollDataChannel::new(dc));
+                    Ok(data_channel.id())
+                },
                 Err(e) => Err(ConnectionError::Internal(e.to_string())),
             }
         })
@@ -155,7 +169,19 @@ impl StreamMuxer for Connection {
         cx: &mut Context<'_>,
         s: &mut Self::OutboundSubstream,
     ) -> Poll<Result<Self::Substream, Self::Error>> {
-        unimplemented!();
+        match ready!(s.as_mut().poll(cx)) {
+            Ok(id) => {
+                let inner = ready!(Pin::new(&mut self.inner.lock()).poll(cx));
+                match inner.data_channels.get(&id) {
+                    Some(dc) => Poll::Ready(Ok(dc.clone())),
+                    None => Poll::Ready(Err(ConnectionError::Internal(format!(
+                        "Can't find substream {}",
+                        id
+                    )))),
+                }
+            },
+            Err(e) => Poll::Ready(Err(e)),
+        }
     }
 
     fn destroy_outbound(&self, substream: Self::OutboundSubstream) {
