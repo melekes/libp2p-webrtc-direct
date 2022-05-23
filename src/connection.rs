@@ -20,7 +20,6 @@
 
 mod poll_data_channel;
 
-use fnv::FnvHashMap;
 use futures::lock::Mutex;
 use futures::{channel::oneshot, future::BoxFuture, prelude::*, ready};
 use libp2p_core::muxing::{StreamMuxer, StreamMuxerEvent};
@@ -30,6 +29,7 @@ use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc_data::data_channel::DataChannel as DetachedDataChannel;
 
+use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -62,8 +62,6 @@ pub struct Connection {
 struct ConnectionInner {
     /// `RTCPeerConnection` to the remote peer.
     connection: RTCPeerConnection,
-    /// A map of data channels
-    data_channels: FnvHashMap<SubstreamId, PollDataChannel>,
     /// The next data channel ID
     next_channel_id: u16,
 }
@@ -73,7 +71,6 @@ impl Connection {
         Self {
             inner: Arc::new(Mutex::new(ConnectionInner {
                 connection,
-                data_channels: FnvHashMap::default(),
                 next_channel_id: 0,
             })),
         }
@@ -82,8 +79,8 @@ impl Connection {
 
 impl StreamMuxer for Connection {
     type Substream = PollDataChannel;
-    type OutboundSubstream = BoxFuture<'static, Result<SubstreamId, Self::Error>>;
-    type Error = ConnectionError;
+    type OutboundSubstream = BoxFuture<'static, Result<Self::Substream, Self::Error>>;
+    type Error = io::Error;
 
     fn poll_event(
         &self,
@@ -113,7 +110,7 @@ impl StreamMuxer for Connection {
                         protocol: None,
                     }),
                 )
-                .map_err(|e| ConnectionError::WebRTC(e))
+                .map_err(|e| io::Error::from(ConnectionError::WebRTC(e)))
                 .await?;
 
             // Increasing `next_channel_id` here prevents two substreams having the same ID.
@@ -153,13 +150,8 @@ impl StreamMuxer for Connection {
 
             // Wait until data channel is opened and ready to use
             match data_channel_tx.await {
-                Ok(dc) => {
-                    let mut lock = inner.lock().await;
-                    lock.data_channels
-                        .insert(data_channel.id(), PollDataChannel::new(dc));
-                    Ok(data_channel.id())
-                },
-                Err(e) => Err(ConnectionError::Internal(e.to_string())),
+                Ok(dc) => Ok(PollDataChannel::new(dc)),
+                Err(e) => Err(io::Error::from(ConnectionError::Internal(e.to_string()))),
             }
         })
     }
@@ -170,22 +162,13 @@ impl StreamMuxer for Connection {
         s: &mut Self::OutboundSubstream,
     ) -> Poll<Result<Self::Substream, Self::Error>> {
         match ready!(s.as_mut().poll(cx)) {
-            Ok(id) => {
-                let inner = ready!(Pin::new(&mut self.inner.lock()).poll(cx));
-                match inner.data_channels.get(&id) {
-                    Some(dc) => Poll::Ready(Ok(dc.clone())),
-                    None => Poll::Ready(Err(ConnectionError::Internal(format!(
-                        "Can't find substream {}",
-                        id
-                    )))),
-                }
-            },
+            Ok(data_channel) => Poll::Ready(Ok(data_channel.clone())),
             Err(e) => Poll::Ready(Err(e)),
         }
     }
 
-    fn destroy_outbound(&self, substream: Self::OutboundSubstream) {
-        unimplemented!();
+    fn destroy_outbound(&self, _substream: Self::OutboundSubstream) {
+        // noop
     }
 
     fn read_substream(
@@ -194,7 +177,7 @@ impl StreamMuxer for Connection {
         s: &mut Self::Substream,
         buf: &mut [u8],
     ) -> Poll<Result<usize, Self::Error>> {
-        unimplemented!();
+        Pin::new(s).poll_read(cx, buf)
     }
 
     fn write_substream(
@@ -203,7 +186,7 @@ impl StreamMuxer for Connection {
         s: &mut Self::Substream,
         buf: &[u8],
     ) -> Poll<Result<usize, Self::Error>> {
-        unimplemented!();
+        Pin::new(s).poll_write(cx, buf)
     }
 
     fn flush_substream(
@@ -211,7 +194,7 @@ impl StreamMuxer for Connection {
         cx: &mut Context<'_>,
         s: &mut Self::Substream,
     ) -> Poll<Result<(), Self::Error>> {
-        unimplemented!();
+        Pin::new(s).poll_flush(cx)
     }
 
     fn shutdown_substream(
@@ -219,11 +202,11 @@ impl StreamMuxer for Connection {
         cx: &mut Context<'_>,
         s: &mut Self::Substream,
     ) -> Poll<Result<(), Self::Error>> {
-        unimplemented!();
+        Pin::new(s).poll_close(cx)
     }
 
-    fn destroy_substream(&self, s: Self::Substream) {
-        unimplemented!();
+    fn destroy_substream(&self, _s: Self::Substream) {
+        // noop
     }
 
     fn close(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
