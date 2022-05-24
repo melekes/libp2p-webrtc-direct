@@ -20,8 +20,9 @@
 
 mod poll_data_channel;
 
+use fnv::FnvHashMap;
 use futures::lock::Mutex;
-use futures::{channel::oneshot, future::BoxFuture, prelude::*, ready};
+use futures::{channel::oneshot, prelude::*, ready};
 use libp2p_core::muxing::{StreamMuxer, StreamMuxerEvent};
 use log::{debug, error, trace};
 use thiserror::Error;
@@ -31,7 +32,10 @@ use webrtc_data::data_channel::DataChannel as DetachedDataChannel;
 
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU16, Ordering},
+    Arc, RwLock,
+};
 use std::task::{Context, Poll};
 
 use poll_data_channel::PollDataChannel;
@@ -56,30 +60,28 @@ impl From<ConnectionError> for std::io::Error {
 /// A WebRTC connection over a single data channel. See lib documentation for
 /// the reasoning as to why a single data channel is being used.
 pub struct Connection {
-    inner: Arc<Mutex<ConnectionInner>>,
-}
-
-struct ConnectionInner {
     /// `RTCPeerConnection` to the remote peer.
-    connection: RTCPeerConnection,
+    connection: Mutex<RTCPeerConnection>,
+    /// A map of data channels
+    data_channels: std::sync::Mutex<FnvHashMap<SubstreamId, PollDataChannel>>,
     /// The next data channel ID
-    next_channel_id: u16,
+    next_channel_id: AtomicU16,
 }
 
 impl Connection {
     pub fn new(connection: RTCPeerConnection) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(ConnectionInner {
-                connection,
-                next_channel_id: 0,
-            })),
+            connection: Mutex::new(connection),
+            data_channels: std::sync::Mutex::new(FnvHashMap::default()),
+            next_channel_id: AtomicU16::new(0),
         }
     }
 }
 
 impl StreamMuxer for Connection {
     type Substream = PollDataChannel;
-    type OutboundSubstream = BoxFuture<'static, Result<Self::Substream, Self::Error>>;
+    type OutboundSubstream =
+        Pin<Box<dyn Future<Output = Result<Arc<DetachedDataChannel>, Self::Error>> + Send>>;
     type Error = io::Error;
 
     fn poll_event(
@@ -90,20 +92,19 @@ impl StreamMuxer for Connection {
     }
 
     fn open_outbound(&self) -> Self::OutboundSubstream {
-        let inner = self.inner.clone();
         Box::pin(async move {
-            let mut lock = inner.lock().await;
+            let mut connection = self.connection.lock().await;
 
-            trace!("Opening outbound substream {}", lock.next_channel_id);
+            let channel_id = self.next_channel_id.fetch_add(1, Ordering::Relaxed);
+            trace!("Opening outbound substream {}", channel_id);
 
             // Create a datachannel with label 'data'
-            let data_channel = lock
-                .connection
+            let data_channel = connection
                 .create_data_channel(
                     "data",
                     Some(RTCDataChannelInit {
                         negotiated: None,
-                        id: Some(lock.next_channel_id),
+                        id: Some(channel_id),
                         ordered: None,
                         max_retransmits: None,
                         max_packet_life_time: None,
@@ -113,10 +114,8 @@ impl StreamMuxer for Connection {
                 .map_err(|e| io::Error::from(ConnectionError::WebRTC(e)))
                 .await?;
 
-            // Increasing `next_channel_id` here prevents two substreams having the same ID.
-            lock.next_channel_id += 1;
-            // No need to hold the lock for DTLS handshake.
-            drop(lock);
+            // No need to hold the lock during the DTLS handshake.
+            drop(connection);
 
             let (data_channel_rx, data_channel_tx) = oneshot::channel::<Arc<DetachedDataChannel>>();
 
@@ -150,7 +149,7 @@ impl StreamMuxer for Connection {
 
             // Wait until data channel is opened and ready to use
             match data_channel_tx.await {
-                Ok(dc) => Ok(PollDataChannel::new(dc)),
+                Ok(detached) => Ok(detached),
                 Err(e) => Err(io::Error::from(ConnectionError::Internal(e.to_string()))),
             }
         })
@@ -162,12 +161,19 @@ impl StreamMuxer for Connection {
         s: &mut Self::OutboundSubstream,
     ) -> Poll<Result<Self::Substream, Self::Error>> {
         match ready!(s.as_mut().poll(cx)) {
-            Ok(data_channel) => Poll::Ready(Ok(data_channel.clone())),
+            Ok(detached) => {
+                let dc = PollDataChannel::new(detached);
+
+                let channels = self.data_channels.lock().unwrap();
+                channels.insert(dc.stream_identifier(), dc.clone());
+
+                Poll::Ready(Ok(dc))
+            },
             Err(e) => Poll::Ready(Err(e)),
         }
     }
 
-    fn destroy_outbound(&self, _substream: Self::OutboundSubstream) {
+    fn destroy_outbound(&self, _s: Self::OutboundSubstream) {
         // noop
     }
 
@@ -205,15 +211,33 @@ impl StreamMuxer for Connection {
         Pin::new(s).poll_close(cx)
     }
 
-    fn destroy_substream(&self, _s: Self::Substream) {
-        // noop
+    fn destroy_substream(&self, s: Self::Substream) {
+        let channels = self.data_channels.lock().unwrap();
+        channels.remove(&s.stream_identifier());
     }
 
     fn close(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        unimplemented!();
+        match ready!(self.flush_all(cx)) {
+            Ok(_) => {
+                for (_, dc) in *self.data_channels.lock().unwrap() {
+                    match ready!(self.shutdown_substream(cx, &mut dc)) {
+                        Ok(_) => continue,
+                        Err(e) => return Poll::Ready(Err(e)),
+                    }
+                }
+                Poll::Ready(Ok(()))
+            },
+            Err(e) => Poll::Ready(Err(e)),
+        }
     }
 
     fn flush_all(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        unimplemented!();
+        for (_, dc) in *self.data_channels.lock().unwrap() {
+            match ready!(self.flush_substream(cx, &mut dc)) {
+                Ok(_) => continue,
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+        }
+        Poll::Ready(Ok(()))
     }
 }

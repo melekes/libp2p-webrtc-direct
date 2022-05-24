@@ -101,6 +101,11 @@ impl PollDataChannel {
     pub fn set_read_buf_capacity(&mut self, capacity: usize) {
         self.read_buf_cap = capacity
     }
+
+    /// StreamIdentifier returns the Stream identifier associated to the stream.
+    pub fn stream_identifier(&self) -> u16 {
+        self.data_channel.stream_identifier()
+    }
 }
 
 impl AsyncRead for PollDataChannel {
