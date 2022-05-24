@@ -22,12 +22,11 @@ mod poll_data_channel;
 
 use fnv::FnvHashMap;
 use futures::channel::mpsc::{self, Receiver, Sender};
-use futures::lock::Mutex;
+use futures::lock::Mutex as FutMutex;
 use futures::{channel::oneshot, future::BoxFuture, prelude::*, ready};
 use futures_lite::stream::StreamExt;
 use libp2p_core::muxing::{StreamMuxer, StreamMuxerEvent};
 use log::{debug, error, trace};
-use thiserror::Error;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::peer_connection::RTCPeerConnection;
@@ -37,60 +36,46 @@ use std::io;
 use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicU16, Ordering},
-    Arc,
+    Arc, Mutex as StdMutex,
 };
 use std::task::{Context, Poll};
 
 use poll_data_channel::PollDataChannel;
 
-pub type SubstreamId = u16;
-
-/// Error in WebRTC.
-#[derive(Error, Debug)]
-pub enum ConnectionError {
-    #[error("webrtc error: {0}")]
-    WebRTC(#[from] webrtc::Error),
-    #[error("internal error: {0} (see debug logs)")]
-    Internal(String),
-}
-
-impl From<ConnectionError> for std::io::Error {
-    fn from(err: ConnectionError) -> Self {
-        std::io::Error::new(std::io::ErrorKind::Other, err)
-    }
-}
-
-/// A WebRTC connection over a single data channel. See lib documentation for
-/// the reasoning as to why a single data channel is being used.
+/// A WebRTC connection, wrapping [`RTCPeerConnection`] and implementing [`StreamMuxer`] trait.
 pub struct Connection {
     inner: Arc<ConnectionInner>,
 }
 
 struct ConnectionInner {
     /// `RTCPeerConnection` to the remote peer.
-    connection: Mutex<RTCPeerConnection>,
-    /// A map of data channels
-    data_channels: std::sync::Mutex<FnvHashMap<SubstreamId, PollDataChannel>>,
-    /// The next data channel ID
-    next_channel_id: AtomicU16,
+    connection: FutMutex<RTCPeerConnection>, // uses futures mutex because used in async code (see open_outbound)
+    /// A map of data channels.
+    data_channels: StdMutex<FnvHashMap<u16, PollDataChannel>>,
+    /// The next outbound data channel ID.
+    next_outbound_channel_id: AtomicU16,
     /// Channel onto which incoming data channels are put.
-    incoming_data_channels_rx: std::sync::Mutex<Receiver<Arc<DetachedDataChannel>>>,
+    incoming_data_channels_rx: StdMutex<Receiver<Arc<DetachedDataChannel>>>,
 }
 
 impl Connection {
+    /// Creates a new connection.
     pub async fn new(connection: RTCPeerConnection) -> Self {
         let (data_channel_tx, data_channel_rx) = mpsc::channel(10);
+
         Connection::register_incoming_data_channels_handler(&connection, data_channel_tx).await;
+
         Self {
             inner: Arc::new(ConnectionInner {
-                connection: Mutex::new(connection),
-                data_channels: std::sync::Mutex::new(FnvHashMap::default()),
-                next_channel_id: AtomicU16::new(0),
-                incoming_data_channels_rx: std::sync::Mutex::new(data_channel_rx),
+                connection: FutMutex::new(connection),
+                data_channels: StdMutex::new(FnvHashMap::default()),
+                next_outbound_channel_id: AtomicU16::new(0),
+                incoming_data_channels_rx: StdMutex::new(data_channel_rx),
             }),
         }
     }
 
+    /// Registers a handler for incoming data channels.
     async fn register_incoming_data_channels_handler(
         connection: &RTCPeerConnection,
         data_channel_tx: Sender<Arc<DetachedDataChannel>>,
@@ -120,8 +105,11 @@ impl Connection {
                                     let data_channel = data_channel.clone();
                                     match data_channel.detach().await {
                                         Ok(detached) => {
-                                            if let Err(_) = data_channel_tx.try_send(detached) {
-                                                error!("data_channel_tx dropped");
+                                            if let Err(e) = data_channel_tx.try_send(detached) {
+                                                // This can happen if the client is not reading
+                                                // events (using `poll_event`) fast enough, which
+                                                // generally shouldn't be the case.
+                                                error!("Can't send data channel: {}", e);
                                             }
                                         },
                                         Err(e) => {
@@ -157,9 +145,10 @@ impl<'a> StreamMuxer for Connection {
 
                 Poll::Ready(Ok(StreamMuxerEvent::InboundSubstream(ch)))
             },
-            None => Poll::Ready(Err(io::Error::from(ConnectionError::Internal(
-                "incoming_data_channels_rx is closed (no messages left)".into(),
-            )))),
+            None => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::Other,
+                "incoming_data_channels_rx is closed (no messages left)",
+            ))),
         }
     }
 
@@ -169,7 +158,9 @@ impl<'a> StreamMuxer for Connection {
         Box::pin(async move {
             let connection = inner.connection.lock().await;
 
-            let channel_id = inner.next_channel_id.fetch_add(1, Ordering::Relaxed);
+            let channel_id = inner
+                .next_outbound_channel_id
+                .fetch_add(1, Ordering::Relaxed);
             trace!("Opening outbound substream {}", channel_id);
 
             // Create a datachannel with label 'data'
@@ -185,7 +176,7 @@ impl<'a> StreamMuxer for Connection {
                         protocol: None,
                     }),
                 )
-                .map_err(|e| io::Error::from(ConnectionError::WebRTC(e)))
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("webrtc error: {}", e)))
                 .await?;
 
             // No need to hold the lock during the DTLS handshake.
@@ -224,7 +215,7 @@ impl<'a> StreamMuxer for Connection {
             // Wait until data channel is opened and ready to use
             match data_channel_tx.await {
                 Ok(detached) => Ok(detached),
-                Err(e) => Err(io::Error::from(ConnectionError::Internal(e.to_string()))),
+                Err(e) => Err(io::Error::new(io::ErrorKind::Other, e.to_string())),
             }
         })
     }
