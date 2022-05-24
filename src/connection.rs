@@ -282,8 +282,10 @@ impl<'a> StreamMuxer for Connection {
     }
 
     fn close(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // First, flush all the buffered data.
         match ready!(self.flush_all(cx)) {
             Ok(_) => {
+                // Second, shutdown all the substreams.
                 let mut channels = self.inner.data_channels.lock().unwrap();
                 for (_, ch) in channels.iter_mut() {
                     match ready!(self.shutdown_substream(cx, ch)) {
@@ -291,6 +293,10 @@ impl<'a> StreamMuxer for Connection {
                         Err(e) => return Poll::Ready(Err(e)),
                     }
                 }
+
+                // Third, close `incoming_data_channels_rx`
+                self.inner.incoming_data_channels_rx.lock().unwrap().close();
+
                 Poll::Ready(Ok(()))
             },
             Err(e) => Poll::Ready(Err(e)),
