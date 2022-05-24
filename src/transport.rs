@@ -376,7 +376,7 @@ impl WebRTCDirectTransport {
             .await?;
 
         // Wait until data channel is opened and ready to use
-        Ok(Connection::new(peer_connection))
+        Ok(Connection::new(peer_connection).await)
     }
 }
 

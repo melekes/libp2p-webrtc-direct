@@ -1150,6 +1150,7 @@ dependencies = [
  "env_logger",
  "fnv",
  "futures",
+ "futures-lite",
  "futures-timer",
  "hex",
  "if-watch",

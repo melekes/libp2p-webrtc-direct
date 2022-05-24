@@ -81,5 +81,5 @@ pub async fn webrtc(
     debug!("ANSWER: {:?}", answer.sdp);
     peer_connection.set_local_description(answer).await?;
 
-    Ok(Connection::new(peer_connection))
+    Ok(Connection::new(peer_connection).await)
 }

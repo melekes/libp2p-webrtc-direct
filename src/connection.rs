@@ -21,12 +21,15 @@
 mod poll_data_channel;
 
 use fnv::FnvHashMap;
+use futures::channel::mpsc::{self, Receiver, Sender};
 use futures::lock::Mutex;
 use futures::{channel::oneshot, future::BoxFuture, prelude::*, ready};
+use futures_lite::stream::StreamExt;
 use libp2p_core::muxing::{StreamMuxer, StreamMuxerEvent};
 use log::{debug, error, trace};
 use thiserror::Error;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
+use webrtc::data_channel::RTCDataChannel;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc_data::data_channel::DataChannel as DetachedDataChannel;
 
@@ -34,7 +37,7 @@ use std::io;
 use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicU16, Ordering},
-    Arc, RwLock,
+    Arc,
 };
 use std::task::{Context, Poll};
 
@@ -70,17 +73,68 @@ struct ConnectionInner {
     data_channels: std::sync::Mutex<FnvHashMap<SubstreamId, PollDataChannel>>,
     /// The next data channel ID
     next_channel_id: AtomicU16,
+    /// Channel onto which incoming data channels are put.
+    incoming_data_channels_rx: std::sync::Mutex<Receiver<Arc<DetachedDataChannel>>>,
 }
 
 impl Connection {
-    pub fn new(connection: RTCPeerConnection) -> Self {
+    pub async fn new(connection: RTCPeerConnection) -> Self {
+        let (data_channel_tx, data_channel_rx) = mpsc::channel(10);
+        Connection::register_incoming_data_channels_handler(&connection, data_channel_tx).await;
         Self {
             inner: Arc::new(ConnectionInner {
                 connection: Mutex::new(connection),
                 data_channels: std::sync::Mutex::new(FnvHashMap::default()),
                 next_channel_id: AtomicU16::new(0),
+                incoming_data_channels_rx: std::sync::Mutex::new(data_channel_rx),
             }),
         }
+    }
+
+    async fn register_incoming_data_channels_handler(
+        connection: &RTCPeerConnection,
+        data_channel_tx: Sender<Arc<DetachedDataChannel>>,
+    ) {
+        connection
+            .on_data_channel(Box::new(move |data_channel: Arc<RTCDataChannel>| {
+                debug!(
+                    "Incoming data channel '{}'-'{}'",
+                    data_channel.label(),
+                    data_channel.id()
+                );
+                let data_channel = data_channel.clone();
+
+                let mut data_channel_tx = data_channel_tx.clone();
+                Box::pin(async move {
+                    data_channel
+                        .on_open({
+                            let data_channel = data_channel.clone();
+                            Box::new(move || {
+                                debug!(
+                                    "Data channel '{}'-'{}' open",
+                                    data_channel.label(),
+                                    data_channel.id()
+                                );
+
+                                Box::pin(async move {
+                                    let data_channel = data_channel.clone();
+                                    match data_channel.detach().await {
+                                        Ok(detached) => {
+                                            if let Err(_) = data_channel_tx.try_send(detached) {
+                                                error!("data_channel_tx dropped");
+                                            }
+                                        },
+                                        Err(e) => {
+                                            error!("Can't detach data channel: {}", e);
+                                        },
+                                    };
+                                })
+                            })
+                        })
+                        .await;
+                })
+            }))
+            .await;
     }
 }
 
@@ -93,7 +147,20 @@ impl<'a> StreamMuxer for Connection {
         &self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<StreamMuxerEvent<Self::Substream>, Self::Error>> {
-        unimplemented!();
+        let mut rx = self.inner.incoming_data_channels_rx.lock().unwrap();
+        match ready!(rx.poll_next(cx)) {
+            Some(detached) => {
+                let ch = PollDataChannel::new(detached);
+
+                let mut channels = self.inner.data_channels.lock().unwrap();
+                channels.insert(ch.stream_identifier(), ch.clone());
+
+                Poll::Ready(Ok(StreamMuxerEvent::InboundSubstream(ch)))
+            },
+            None => Poll::Ready(Err(io::Error::from(ConnectionError::Internal(
+                "incoming_data_channels_rx is closed (no messages left)".into(),
+            )))),
+        }
     }
 
     fn open_outbound(&self) -> Self::OutboundSubstream {
@@ -132,7 +199,7 @@ impl<'a> StreamMuxer for Connection {
                     let data_channel = data_channel.clone();
                     Box::new(move || {
                         debug!(
-                            "Data channel '{}'-'{}' open.",
+                            "Data channel '{}'-'{}' open",
                             data_channel.label(),
                             data_channel.id()
                         );
