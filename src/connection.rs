@@ -22,7 +22,7 @@ mod poll_data_channel;
 
 use fnv::FnvHashMap;
 use futures::lock::Mutex;
-use futures::{channel::oneshot, prelude::*, ready};
+use futures::{channel::oneshot, future::BoxFuture, prelude::*, ready};
 use libp2p_core::muxing::{StreamMuxer, StreamMuxerEvent};
 use log::{debug, error, trace};
 use thiserror::Error;
@@ -60,6 +60,10 @@ impl From<ConnectionError> for std::io::Error {
 /// A WebRTC connection over a single data channel. See lib documentation for
 /// the reasoning as to why a single data channel is being used.
 pub struct Connection {
+    inner: Arc<ConnectionInner>,
+}
+
+struct ConnectionInner {
     /// `RTCPeerConnection` to the remote peer.
     connection: Mutex<RTCPeerConnection>,
     /// A map of data channels
@@ -71,17 +75,18 @@ pub struct Connection {
 impl Connection {
     pub fn new(connection: RTCPeerConnection) -> Self {
         Self {
-            connection: Mutex::new(connection),
-            data_channels: std::sync::Mutex::new(FnvHashMap::default()),
-            next_channel_id: AtomicU16::new(0),
+            inner: Arc::new(ConnectionInner {
+                connection: Mutex::new(connection),
+                data_channels: std::sync::Mutex::new(FnvHashMap::default()),
+                next_channel_id: AtomicU16::new(0),
+            }),
         }
     }
 }
 
-impl StreamMuxer for Connection {
+impl<'a> StreamMuxer for Connection {
     type Substream = PollDataChannel;
-    type OutboundSubstream =
-        Pin<Box<dyn Future<Output = Result<Arc<DetachedDataChannel>, Self::Error>> + Send>>;
+    type OutboundSubstream = BoxFuture<'static, Result<Arc<DetachedDataChannel>, Self::Error>>;
     type Error = io::Error;
 
     fn poll_event(
@@ -92,10 +97,12 @@ impl StreamMuxer for Connection {
     }
 
     fn open_outbound(&self) -> Self::OutboundSubstream {
-        Box::pin(async move {
-            let mut connection = self.connection.lock().await;
+        let inner = self.inner.clone();
 
-            let channel_id = self.next_channel_id.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async move {
+            let connection = inner.connection.lock().await;
+
+            let channel_id = inner.next_channel_id.fetch_add(1, Ordering::Relaxed);
             trace!("Opening outbound substream {}", channel_id);
 
             // Create a datachannel with label 'data'
@@ -162,12 +169,12 @@ impl StreamMuxer for Connection {
     ) -> Poll<Result<Self::Substream, Self::Error>> {
         match ready!(s.as_mut().poll(cx)) {
             Ok(detached) => {
-                let dc = PollDataChannel::new(detached);
+                let ch = PollDataChannel::new(detached);
 
-                let channels = self.data_channels.lock().unwrap();
-                channels.insert(dc.stream_identifier(), dc.clone());
+                let mut channels = self.inner.data_channels.lock().unwrap();
+                channels.insert(ch.stream_identifier(), ch.clone());
 
-                Poll::Ready(Ok(dc))
+                Poll::Ready(Ok(ch))
             },
             Err(e) => Poll::Ready(Err(e)),
         }
@@ -212,15 +219,16 @@ impl StreamMuxer for Connection {
     }
 
     fn destroy_substream(&self, s: Self::Substream) {
-        let channels = self.data_channels.lock().unwrap();
+        let mut channels = self.inner.data_channels.lock().unwrap();
         channels.remove(&s.stream_identifier());
     }
 
     fn close(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         match ready!(self.flush_all(cx)) {
             Ok(_) => {
-                for (_, dc) in *self.data_channels.lock().unwrap() {
-                    match ready!(self.shutdown_substream(cx, &mut dc)) {
+                let mut channels = self.inner.data_channels.lock().unwrap();
+                for (_, ch) in channels.iter_mut() {
+                    match ready!(self.shutdown_substream(cx, ch)) {
                         Ok(_) => continue,
                         Err(e) => return Poll::Ready(Err(e)),
                     }
@@ -232,8 +240,9 @@ impl StreamMuxer for Connection {
     }
 
     fn flush_all(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        for (_, dc) in *self.data_channels.lock().unwrap() {
-            match ready!(self.flush_substream(cx, &mut dc)) {
+        let mut channels = self.inner.data_channels.lock().unwrap();
+        for (_, ch) in channels.iter_mut() {
+            match ready!(self.flush_substream(cx, ch)) {
                 Ok(_) => continue,
                 Err(e) => return Poll::Ready(Err(e)),
             }
