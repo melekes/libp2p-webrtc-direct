@@ -138,6 +138,8 @@ impl<'a> StreamMuxer for Connection {
         let mut rx = self.inner.incoming_data_channels_rx.lock().unwrap();
         match ready!(rx.poll_next(cx)) {
             Some(detached) => {
+                drop(rx);
+
                 let ch = PollDataChannel::new(detached);
 
                 let mut channels = self.inner.data_channels.lock().unwrap();
@@ -293,6 +295,7 @@ impl<'a> StreamMuxer for Connection {
                         Err(e) => return Poll::Ready(Err(e)),
                     }
                 }
+                drop(channels);
 
                 // Third, close `incoming_data_channels_rx`
                 self.inner.incoming_data_channels_rx.lock().unwrap().close();
