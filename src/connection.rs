@@ -238,9 +238,9 @@ impl<'a> StreamMuxer for Connection {
         }
     }
 
-    fn destroy_outbound(&self, _s: Self::OutboundSubstream) {
-        // noop
-    }
+    /// NOTE: `_s` might be waiting at one of the await points, and dropping the future will
+    /// abruptly interrupt the execution.
+    fn destroy_outbound(&self, _s: Self::OutboundSubstream) {}
 
     fn read_substream(
         &self,
