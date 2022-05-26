@@ -4,6 +4,7 @@ use futures::future::FutureExt;
 use futures::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use futures::stream::StreamExt;
 use libp2p_core::identity;
+use libp2p_core::multiaddr::Protocol;
 use libp2p_core::upgrade;
 use libp2p_request_response::{
     ProtocolName, ProtocolSupport, RequestResponse, RequestResponseCodec, RequestResponseConfig,
@@ -15,10 +16,10 @@ use log::trace;
 use rand::RngCore;
 use rcgen::KeyPair;
 use tokio_crate as tokio;
-
-use std::{io, iter};
-
 use webrtc::peer_connection::certificate::RTCCertificate;
+
+use std::borrow::Cow;
+use std::{io, iter};
 
 fn generate_certificate() -> RTCCertificate {
     let kp = KeyPair::generate(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key pair");
@@ -29,32 +30,30 @@ fn generate_tls_keypair() -> identity::Keypair {
     identity::Keypair::generate_ed25519()
 }
 
-async fn create_swarm() -> Result<Swarm<RequestResponse<PingCodec>>> {
+async fn create_swarm() -> Result<(Swarm<RequestResponse<PingCodec>>, String)> {
     let cert = generate_certificate();
     let keypair = generate_tls_keypair();
     let peer_id = keypair.public().to_peer_id();
-    let transport = WebRTCDirectTransport::new(cert, keypair, "127.0.0.1:0")
-        .await?
-        .boxed();
-
+    let transport = WebRTCDirectTransport::new(cert, keypair, "127.0.0.1:0").await?;
+    let fingerprint = transport.cert_fingerprint();
     let protocols = iter::once((PingProtocol(), ProtocolSupport::Full));
     let cfg = RequestResponseConfig::default();
     let behaviour = RequestResponse::new(PingCodec(), protocols, cfg);
     trace!("{}", peer_id);
-    Ok(Swarm::new(transport, behaviour, peer_id))
+    Ok((
+        Swarm::new(transport.boxed(), behaviour, peer_id),
+        fingerprint,
+    ))
 }
 
 #[tokio::test]
 async fn smoke() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .try_init()
-        .ok();
-    log_panics::init();
+    let _ = env_logger::builder().is_test(true).try_init();
+
     let mut rng = rand::thread_rng();
 
-    let mut a = create_swarm().await?;
-    let mut b = create_swarm().await?;
+    let (mut a, a_fingerprint) = create_swarm().await?;
+    let (mut b, _b_fingerprint) = create_swarm().await?;
 
     Swarm::listen_on(&mut a, "/ip4/127.0.0.1/udp/0".parse()?)?;
 
@@ -62,6 +61,9 @@ async fn smoke() -> Result<()> {
         Some(SwarmEvent::NewListenAddr { address, .. }) => address,
         e => panic!("{:?}", e),
     };
+    let addr = addr.with(Protocol::XWebRTC(hex_to_cow(
+        &a_fingerprint.replace(":", ""),
+    )));
 
     let mut data = vec![0; 4096 * 10];
     rng.fill_bytes(&mut data);
@@ -252,14 +254,10 @@ impl RequestResponseCodec for PingCodec {
 
 #[tokio::test]
 async fn dial_failure() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .try_init()
-        .ok();
-    log_panics::init();
+    let _ = env_logger::builder().is_test(true).try_init();
 
-    let mut a = create_swarm().await?;
-    let mut b = create_swarm().await?;
+    let (mut a, a_fingerprint) = create_swarm().await?;
+    let (mut b, _b_fingerprint) = create_swarm().await?;
 
     Swarm::listen_on(&mut a, "/ip4/127.0.0.1/udp/0".parse()?)?;
 
@@ -267,6 +265,10 @@ async fn dial_failure() -> Result<()> {
         Some(SwarmEvent::NewListenAddr { address, .. }) => address,
         e => panic!("{:?}", e),
     };
+    let addr = addr.with(Protocol::XWebRTC(hex_to_cow(
+        &a_fingerprint.replace(":", ""),
+    )));
+
     let a_peer_id = &Swarm::local_peer_id(&a).clone();
     drop(a); // stop a swarm so b can never reach it
 
@@ -290,4 +292,10 @@ async fn dial_failure() -> Result<()> {
     };
 
     Ok(())
+}
+
+fn hex_to_cow<'a>(s: &str) -> Cow<'a, [u8; 32]> {
+    let mut buf = [0; 32];
+    hex::decode_to_slice(s, &mut buf).unwrap();
+    Cow::Owned(buf)
 }

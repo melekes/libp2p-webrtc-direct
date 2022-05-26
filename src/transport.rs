@@ -136,7 +136,7 @@ impl WebRTCDirectTransport {
 
     /// Returns the SHA-256 fingerprint of the certificate in lowercase hex string as expressed
     /// utilizing the syntax of 'fingerprint' in <https://tools.ietf.org/html/rfc4572#section-5>.
-    fn cert_fingerprint(&self) -> String {
+    pub fn cert_fingerprint(&self) -> String {
         fingerprint_of_first_certificate(&self.config)
     }
 
