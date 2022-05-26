@@ -18,23 +18,34 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-use libp2p_core::{
-    multiaddr::{Multiaddr, Protocol},
-    transport::{ListenerEvent, TransportError},
-    Transport,
+use futures::{
+    channel::{mpsc, oneshot},
+    future,
+    future::BoxFuture,
+    prelude::*,
+    ready, select, TryFutureExt,
 };
-
-use futures::{channel::mpsc, future::BoxFuture, prelude::*, ready, TryFutureExt};
 use futures_timer::Delay;
 use if_watch::{IfEvent, IfWatcher};
-use log::{debug, trace};
+use libp2p_core::identity;
+use libp2p_core::{
+    multiaddr::{Multiaddr, Protocol},
+    muxing::StreamMuxerBox,
+    transport::{Boxed, ListenerEvent, TransportError},
+    PeerId, Transport,
+};
+use libp2p_core::{OutboundUpgrade, UpgradeInfo};
+use libp2p_noise::{Keypair, NoiseConfig, NoiseError, RemoteIdentity, X25519Spec};
+use log::{debug, error, trace};
 use tinytemplate::TinyTemplate;
 use tokio_crate::net::{ToSocketAddrs, UdpSocket};
 use webrtc::api::setting_engine::SettingEngine;
 use webrtc::api::APIBuilder;
+use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::peer_connection::certificate::RTCCertificate;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+use webrtc_data::data_channel::DataChannel as DetachedDataChannel;
 use webrtc_ice::network_type::NetworkType;
 use webrtc_ice::udp_mux::UDPMux;
 use webrtc_ice::udp_network::UDPNetwork;
@@ -52,6 +63,7 @@ use crate::error::Error;
 use crate::sdp;
 
 use crate::connection::Connection;
+use crate::connection::PollDataChannel;
 use crate::udp_mux::UDPMuxNewAddr;
 use crate::udp_mux::UDPMuxParams;
 use crate::upgrade;
@@ -83,6 +95,9 @@ pub struct WebRTCDirectTransport {
 
     /// The receiver for new `SocketAddr` connecting to this peer.
     new_addr_rx: Arc<Mutex<mpsc::Receiver<Multiaddr>>>,
+
+    /// `Keypair` identifying this peer
+    id_keys: identity::Keypair,
 }
 
 impl WebRTCDirectTransport {
@@ -91,6 +106,7 @@ impl WebRTCDirectTransport {
     /// Creates a UDP socket bound to `listen_addr`.
     pub async fn new<A: ToSocketAddrs>(
         certificate: RTCCertificate,
+        id_keys: identity::Keypair,
         listen_addr: A,
     ) -> Result<Self, TransportError<Error>> {
         // Bind to `listen_addr` and construct a UDP mux.
@@ -114,6 +130,7 @@ impl WebRTCDirectTransport {
             udp_mux,
             udp_mux_addr,
             new_addr_rx: Arc::new(Mutex::new(new_addr_rx)),
+            id_keys,
         })
     }
 
@@ -122,10 +139,18 @@ impl WebRTCDirectTransport {
     fn cert_fingerprint(&self) -> String {
         fingerprint_of_first_certificate(&self.config)
     }
+
+    /// Creates a boxed libp2p transport.
+    pub fn boxed(self) -> Boxed<(PeerId, StreamMuxerBox)> {
+        Transport::map(self, |(peer_id, conn), _| {
+            (peer_id, StreamMuxerBox::new(conn))
+        })
+        .boxed()
+    }
 }
 
 impl Transport for WebRTCDirectTransport {
-    type Output = Connection;
+    type Output = (PeerId, Connection);
     type Error = Error;
     type Listener = WebRTCListenStream;
     type ListenerUpgrade = BoxFuture<'static, Result<Self::Output, Self::Error>>;
@@ -138,6 +163,7 @@ impl Transport for WebRTCDirectTransport {
             self.config.clone(),
             self.udp_mux.clone(),
             self.new_addr_rx.clone(),
+            self.id_keys.clone(),
         ))
     }
 
@@ -180,6 +206,8 @@ pub struct WebRTCListenStream {
     udp_mux: Arc<dyn UDPMux + Send + Sync>,
     /// The receiver for new `SocketAddr` connecting to this peer.
     new_addr_rx: Arc<Mutex<mpsc::Receiver<Multiaddr>>>,
+    /// `Keypair` identifying this peer
+    id_keys: identity::Keypair,
 }
 
 impl WebRTCListenStream {
@@ -190,6 +218,7 @@ impl WebRTCListenStream {
         config: RTCConfiguration,
         udp_mux: Arc<dyn UDPMux + Send + Sync>,
         new_addr_rx: Arc<Mutex<mpsc::Receiver<Multiaddr>>>,
+        id_keys: identity::Keypair,
     ) -> Self {
         // Check whether the listening IP is set or not.
         let in_addr = if match &listen_addr {
@@ -215,12 +244,16 @@ impl WebRTCListenStream {
             config,
             udp_mux,
             new_addr_rx,
+            id_keys,
         }
     }
 }
 
 impl Stream for WebRTCListenStream {
-    type Item = Result<ListenerEvent<BoxFuture<'static, Result<Connection, Error>>, Error>, Error>;
+    type Item = Result<
+        ListenerEvent<BoxFuture<'static, Result<(PeerId, Connection), Error>>, Error>,
+        Error,
+    >;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         let me = Pin::into_inner(self);
@@ -312,8 +345,12 @@ impl Stream for WebRTCListenStream {
                 Poll::Ready(Some(addr)) => Poll::Ready(Some(Ok(ListenerEvent::Upgrade {
                     local_addr: ip_to_multiaddr(me.listen_addr.ip(), me.listen_addr.port()),
                     remote_addr: addr.clone(),
-                    upgrade: Box::pin(upgrade::webrtc(me.udp_mux.clone(), me.config.clone(), addr))
-                        as BoxFuture<'static, _>,
+                    upgrade: Box::pin(upgrade::webrtc(
+                        me.udp_mux.clone(),
+                        me.config.clone(),
+                        addr,
+                        me.id_keys.clone(),
+                    )) as BoxFuture<'static, _>,
                 }))),
                 Poll::Ready(None) => Poll::Ready(None),
                 Poll::Pending => Poll::Pending,
@@ -323,7 +360,7 @@ impl Stream for WebRTCListenStream {
 }
 
 impl WebRTCDirectTransport {
-    async fn do_dial(self, addr: Multiaddr) -> Result<Connection, Error> {
+    async fn do_dial(self, addr: Multiaddr) -> Result<(PeerId, Connection), Error> {
         let socket_addr =
             multiaddr_to_socketaddr(&addr).ok_or_else(|| Error::InvalidMultiaddr(addr.clone()))?;
         if socket_addr.port() == 0 || socket_addr.ip().is_unspecified() {
@@ -375,8 +412,82 @@ impl WebRTCDirectTransport {
             .map_err(Error::WebRTC)
             .await?;
 
+        // Create a datachannel with label 'data'
+        let data_channel = peer_connection
+            .create_data_channel(
+                "data",
+                Some(RTCDataChannelInit {
+                    negotiated: None,
+                    id: Some(1),
+                    ordered: None,
+                    max_retransmits: None,
+                    max_packet_life_time: None,
+                    protocol: None,
+                }),
+            )
+            .await?;
+
+        let (data_channel_rx, mut data_channel_tx) = oneshot::channel::<Arc<DetachedDataChannel>>();
+
+        // Wait until the data channel is opened and detach it.
+        data_channel
+            .on_open({
+                let data_channel = data_channel.clone();
+                Box::new(move || {
+                    debug!(
+                        "Data channel '{}'-'{}' open.",
+                        data_channel.label(),
+                        data_channel.id()
+                    );
+
+                    Box::pin(async move {
+                        let data_channel = data_channel.clone();
+                        match data_channel.detach().await {
+                            Ok(detached) => {
+                                if let Err(_) = data_channel_rx.send(detached) {
+                                    error!("data_channel_tx dropped");
+                                }
+                            },
+                            Err(e) => {
+                                error!("Can't detach data channel: {}", e);
+                            },
+                        };
+                    })
+                })
+            })
+            .await;
+
         // Wait until data channel is opened and ready to use
-        Ok(Connection::new(peer_connection).await)
+        let detached = select! {
+            res = data_channel_tx => match res {
+                Ok(detached) => detached,
+                Err(e) => return Err(Error::InternalError(e.to_string())),
+            },
+            _ = Delay::new(Duration::from_secs(10)).fuse() => return Err(Error::InternalError(
+                "data channel opening took longer than 10 seconds (see logs)".into(),
+            ))
+        };
+
+        trace!("noise handshake with {}", remote);
+        let dh_keys = Keypair::<X25519Spec>::new()
+            .into_authentic(&self.id_keys)
+            .unwrap();
+        let noise = NoiseConfig::xx(dh_keys);
+        let info = noise.protocol_info().next().unwrap();
+        // after noise is successful and we've authenticated the remote peer, encrypted IO is no
+        // longer needed, hence ignored here.
+        let (peer_id, _) = noise
+            .upgrade_outbound(PollDataChannel::new(detached), info)
+            .and_then(|(remote, io)| match remote {
+                RemoteIdentity::IdentityKey(pk) => future::ok((pk.to_peer_id(), io)),
+                _ => future::err(NoiseError::AuthenticationFailed),
+            })
+            .await
+            .map_err(Error::Noise)?;
+
+        // TODO: assert_eq!(peer_id, peer_id from Multiaddr)
+
+        Ok((peer_id, Connection::new(peer_connection).await))
     }
 }
 
@@ -591,7 +702,8 @@ mod tests {
         let transport = {
             let kp = KeyPair::generate(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key pair");
             let cert = RTCCertificate::from_key_pair(kp).expect("certificate");
-            WebRTCDirectTransport::new(cert, listen_addr)
+            let id_keys = identity::Keypair::generate_ed25519();
+            WebRTCDirectTransport::new(cert, id_keys, listen_addr)
                 .await
                 .expect("transport")
         };
@@ -624,8 +736,9 @@ mod tests {
         let transport2 = {
             let kp = KeyPair::generate(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key pair");
             let cert = RTCCertificate::from_key_pair(kp).expect("certificate");
+            let id_keys = identity::Keypair::generate_ed25519();
             // okay to reuse `listen_addr` since the port is `0` (any).
-            WebRTCDirectTransport::new(cert, listen_addr)
+            WebRTCDirectTransport::new(cert, id_keys, listen_addr)
                 .await
                 .expect("transport")
         };

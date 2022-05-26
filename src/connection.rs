@@ -37,7 +37,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context, Poll};
 
-use poll_data_channel::PollDataChannel;
+pub(crate) use poll_data_channel::PollDataChannel;
 
 /// A WebRTC connection, wrapping [`RTCPeerConnection`] and implementing [`StreamMuxer`] trait.
 pub struct Connection {

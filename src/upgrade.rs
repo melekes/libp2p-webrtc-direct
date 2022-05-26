@@ -18,17 +18,29 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
-use libp2p_core::multiaddr::{Multiaddr, Protocol};
-use log::{debug, trace};
+use futures::{channel::oneshot, future, select, FutureExt, TryFutureExt};
+use futures_timer::Delay;
+use libp2p_core::identity;
+use libp2p_core::{
+    multiaddr::{Multiaddr, Protocol},
+    PeerId,
+};
+use libp2p_core::{InboundUpgrade, UpgradeInfo};
+use libp2p_noise::{Keypair, NoiseConfig, NoiseError, RemoteIdentity, X25519Spec};
+use log::{debug, error, trace};
 use webrtc::api::APIBuilder;
+use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::dtls_transport::dtls_role::DTLSRole;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+use webrtc_data::data_channel::DataChannel as DetachedDataChannel;
 use webrtc_ice::udp_mux::UDPMux;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::connection::Connection;
+use crate::connection::PollDataChannel;
 use crate::error::Error;
 use crate::sdp;
 use crate::transport;
@@ -37,7 +49,8 @@ pub async fn webrtc(
     udp_mux: Arc<dyn UDPMux + Send + Sync>,
     config: RTCConfiguration,
     addr: Multiaddr,
-) -> Result<Connection, Error> {
+    id_keys: identity::Keypair,
+) -> Result<(PeerId, Connection), Error> {
     trace!("upgrading {}", addr);
 
     let socket_addr = transport::multiaddr_to_socketaddr(&addr)
@@ -81,5 +94,81 @@ pub async fn webrtc(
     debug!("ANSWER: {:?}", answer.sdp);
     peer_connection.set_local_description(answer).await?;
 
-    Ok(Connection::new(peer_connection).await)
+    // Create a datachannel with label 'data'.
+    let data_channel = peer_connection
+        .create_data_channel(
+            "data",
+            Some(RTCDataChannelInit {
+                negotiated: Some(true),
+                id: Some(1),
+                ordered: None,
+                max_retransmits: None,
+                max_packet_life_time: None,
+                protocol: None,
+            }),
+        )
+        .await?;
+
+    let (data_channel_rx, mut data_channel_tx) = oneshot::channel::<Arc<DetachedDataChannel>>();
+
+    // Wait until the data channel is opened and detach it.
+    // Wait until the data channel is opened and detach it.
+    data_channel
+        .on_open({
+            let data_channel = data_channel.clone();
+            Box::new(move || {
+                debug!(
+                    "Data channel '{}'-'{}' open.",
+                    data_channel.label(),
+                    data_channel.id()
+                );
+
+                Box::pin(async move {
+                    let data_channel = data_channel.clone();
+                    match data_channel.detach().await {
+                        Ok(detached) => {
+                            if let Err(_) = data_channel_rx.send(detached) {
+                                error!("data_channel_tx dropped");
+                            }
+                        },
+                        Err(e) => {
+                            error!("Can't detach data channel: {}", e);
+                        },
+                    }
+                })
+            })
+        })
+        .await;
+
+    // Wait until data channel is opened and ready to use
+    let detached = select! {
+        res = data_channel_tx => match res {
+            Ok(detached) => detached,
+            Err(e) => return Err(Error::InternalError(e.to_string())),
+        },
+        _ = Delay::new(Duration::from_secs(10)).fuse() => return Err(Error::InternalError(
+            "data channel opening took longer than 10 seconds (see logs)".into(),
+        ))
+    };
+
+    trace!("noise handshake with {}", addr);
+    let dh_keys = Keypair::<X25519Spec>::new()
+        .into_authentic(&id_keys)
+        .unwrap();
+    let noise = NoiseConfig::xx(dh_keys);
+    let info = noise.protocol_info().next().unwrap();
+    // after noise is successful and we've authenticated the remote peer, encrypted IO is no
+    // longer needed, hence ignored here.
+    let (peer_id, _) = noise
+        .upgrade_inbound(PollDataChannel::new(detached), info)
+        .and_then(|(remote, io)| match remote {
+            RemoteIdentity::IdentityKey(pk) => future::ok((pk.to_peer_id(), io)),
+            _ => future::err(NoiseError::AuthenticationFailed),
+        })
+        .await
+        .map_err(Error::Noise)?;
+
+    // TODO: assert_eq!(peer_id, peer_id from Multiaddr)
+
+    Ok((peer_id, Connection::new(peer_connection).await))
 }
