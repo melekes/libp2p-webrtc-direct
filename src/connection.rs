@@ -69,7 +69,8 @@ impl Connection {
         Self {
             connection_inner: Arc::new(FutMutex::new(ConnectionInner {
                 rtc_conn,
-                next_outbound_channel_id: 0,
+                // Starts with `2` because `1` is reserved for the data channel used for authentication.
+                next_outbound_channel_id: 2,
             })),
             data_channels_inner: StdMutex::new(DataChannelsInner {
                 map: FnvHashMap::default(),
