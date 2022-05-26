@@ -32,7 +32,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 /// Default capacity of the temporary read buffer used by [`PollStream`].
-const DEFAULT_READ_BUF_SIZE: usize = 4096;
+const DEFAULT_READ_BUF_SIZE: usize = 8192;
 
 /// State of the read `Future` in [`PollStream`].
 enum ReadFut {
