@@ -10,7 +10,7 @@ use libp2p_request_response::{
     ProtocolName, ProtocolSupport, RequestResponse, RequestResponseCodec, RequestResponseConfig,
     RequestResponseEvent, RequestResponseMessage,
 };
-use libp2p_swarm::{Swarm, SwarmEvent};
+use libp2p_swarm::{Swarm, SwarmBuilder, SwarmEvent};
 use libp2p_webrtc_direct::transport::WebRTCDirectTransport;
 use log::trace;
 use rand::RngCore;
@@ -41,7 +41,11 @@ async fn create_swarm() -> Result<(Swarm<RequestResponse<PingCodec>>, String)> {
     let behaviour = RequestResponse::new(PingCodec(), protocols, cfg);
     trace!("{}", peer_id);
     Ok((
-        Swarm::new(transport.boxed(), behaviour, peer_id),
+        SwarmBuilder::new(transport.boxed(), behaviour, peer_id)
+            .executor(Box::new(|fut| {
+                tokio::spawn(fut);
+            }))
+            .build(),
         fingerprint,
     ))
 }
