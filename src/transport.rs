@@ -392,11 +392,9 @@ impl WebRTCDirectTransport {
             .await?;
 
         // Set the remote description to the predefined SDP.
-        let fingerprint = match addr.iter().last() {
-            Some(Protocol::XWebRTC(f)) => f,
-            _ => {
-                return Err(Error::InvalidMultiaddr(addr));
-            },
+        let fingerprint = match fingerprint_from_addr(&addr) {
+            Some(f) => f,
+            None => return Err(Error::InvalidMultiaddr(addr.clone())),
         };
         let server_session_description = render_description(
             sdp::SERVER_SESSION_DESCRIPTION,
@@ -594,6 +592,17 @@ pub(crate) fn build_setting_engine(
     };
     se.set_network_types(vec![network_type]);
     se
+}
+
+fn fingerprint_from_addr<'a>(addr: &'a Multiaddr) -> Option<Cow<'a, [u8; 32]>> {
+    let mut iter = addr.iter();
+    while let Some(proto) = iter.next() {
+        match proto {
+            Protocol::XWebRTC(f) => return Some(f),
+            _ => continue,
+        }
+    }
+    None
 }
 
 // Tests //////////////////////////////////////////////////////////////////////////////////////////
