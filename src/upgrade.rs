@@ -160,7 +160,7 @@ pub async fn webrtc(
     // after noise is successful and we've authenticated the remote peer, encrypted IO is no
     // longer needed, hence ignored here.
     let (peer_id, _) = noise
-        .upgrade_inbound(PollDataChannel::new(detached), info)
+        .upgrade_inbound(PollDataChannel::new(detached.clone()), info)
         .and_then(|(remote, io)| match remote {
             RemoteIdentity::IdentityKey(pk) => future::ok((pk.to_peer_id(), io)),
             _ => future::err(NoiseError::AuthenticationFailed),
@@ -168,7 +168,12 @@ pub async fn webrtc(
         .await
         .map_err(Error::Noise)?;
 
-    // TODO: assert_eq!(peer_id, peer_id from Multiaddr)
+    // Close the initial data channel after noise handshake is done.
+    // NOTE: must be done on the receiving side (this) to avoid closing before noise is completed.
+    detached
+        .close()
+        .await
+        .map_err(|e| Error::WebRTC(e.into()))?;
 
     Ok((peer_id, Connection::new(peer_connection).await))
 }

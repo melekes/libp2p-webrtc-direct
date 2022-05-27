@@ -483,7 +483,15 @@ impl WebRTCDirectTransport {
             .await
             .map_err(Error::Noise)?;
 
-        // TODO: assert_eq!(peer_id, peer_id from Multiaddr)
+        // Verify peer's identity.
+        let peer_id_from_addr = PeerId::try_from_multiaddr(&addr);
+        if peer_id_from_addr.is_none() || peer_id_from_addr.unwrap() != peer_id {
+            error!(
+                "peer_id_from_addr {:?} != peer_id {:?}",
+                peer_id_from_addr, peer_id
+            );
+            return Err(Error::InvalidMultiaddr(addr.clone()));
+        }
 
         Ok((peer_id, Connection::new(peer_connection).await))
     }
@@ -708,10 +716,11 @@ mod tests {
     }
 
     async fn connect(listen_addr: SocketAddr) {
+        let id_keys = identity::Keypair::generate_ed25519();
+        let t1_peer_id = PeerId::from_public_key(&id_keys.public().into());
         let transport = {
             let kp = KeyPair::generate(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key pair");
             let cert = RTCCertificate::from_key_pair(kp).expect("certificate");
-            let id_keys = identity::Keypair::generate_ed25519();
             WebRTCDirectTransport::new(cert, id_keys, listen_addr)
                 .await
                 .expect("transport")
@@ -744,8 +753,8 @@ mod tests {
 
         let transport2 = {
             let kp = KeyPair::generate(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key pair");
-            let cert = RTCCertificate::from_key_pair(kp).expect("certificate");
             let id_keys = identity::Keypair::generate_ed25519();
+            let cert = RTCCertificate::from_key_pair(kp).expect("certificate");
             // okay to reuse `listen_addr` since the port is `0` (any).
             WebRTCDirectTransport::new(cert, id_keys, listen_addr)
                 .await
@@ -754,7 +763,10 @@ mod tests {
         // TODO: make code cleaner wrt ":"
         let f = &transport.cert_fingerprint().replace(":", "");
         let outbound = transport2
-            .dial(addr.with(Protocol::XWebRTC(hex_to_cow(f))))
+            .dial(
+                addr.with(Protocol::XWebRTC(hex_to_cow(f)))
+                    .with(Protocol::P2p(t1_peer_id.into())),
+            )
             .unwrap();
 
         let (a, b) = futures::join!(inbound, outbound);
