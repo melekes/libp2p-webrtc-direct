@@ -189,10 +189,7 @@ impl<'a> StreamMuxer for Connection {
                     Some(RTCDataChannelInit {
                         negotiated: None,
                         id: Some(channel_id),
-                        ordered: None,
-                        max_retransmits: None,
-                        max_packet_life_time: None,
-                        protocol: None,
+                        ..Default::default()
                     }),
                 )
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("webrtc error: {}", e)))

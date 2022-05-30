@@ -417,10 +417,7 @@ impl WebRTCDirectTransport {
                 Some(RTCDataChannelInit {
                     negotiated: None,
                     id: Some(1),
-                    ordered: None,
-                    max_retransmits: None,
-                    max_packet_life_time: None,
-                    protocol: None,
+                    ..Default::default()
                 }),
             )
             .await?;

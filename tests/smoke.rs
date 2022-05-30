@@ -69,7 +69,7 @@ async fn smoke() -> Result<()> {
         &a_fingerprint.replace(":", ""),
     )));
 
-    let mut data = vec![0; 4096 * 2];
+    let mut data = vec![0; 4096];
     rng.fill_bytes(&mut data);
 
     b.behaviour_mut()
@@ -205,7 +205,7 @@ impl RequestResponseCodec for PingCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        upgrade::read_length_prefixed(io, 4096 * 2)
+        upgrade::read_length_prefixed(io, 4096)
             .map(|res| match res {
                 Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
                 Ok(vec) if vec.is_empty() => Err(io::ErrorKind::UnexpectedEof.into()),
@@ -218,7 +218,7 @@ impl RequestResponseCodec for PingCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        upgrade::read_length_prefixed(io, 4096 * 2)
+        upgrade::read_length_prefixed(io, 4096)
             .map(|res| match res {
                 Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
                 Ok(vec) if vec.is_empty() => Err(io::ErrorKind::UnexpectedEof.into()),
