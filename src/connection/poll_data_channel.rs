@@ -97,9 +97,9 @@ impl PollDataChannel {
         self.data_channel.clone()
     }
 
-    /// Set the capacity of the temporary read buffer (default: 4096).
-    pub fn set_read_buf_capacity(&mut self, capacity: usize) {
-        self.read_buf_cap = capacity
+    /// Set the capacity of the temporary read buffer (default: 8192).
+    pub fn set_read_buf_capacity(&mut self, cap: usize) {
+        self.read_buf_cap = cap
     }
 
     /// StreamIdentifier returns the Stream identifier associated to the stream.

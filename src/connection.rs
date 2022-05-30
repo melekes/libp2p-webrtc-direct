@@ -57,6 +57,9 @@ struct DataChannelsInner {
     map: FnvHashMap<u16, PollDataChannel>,
     /// Channel onto which incoming data channels are put.
     incoming_data_channels_rx: Receiver<Arc<DetachedDataChannel>>,
+    /// Temporary read buffer's capacity (equal for all data channels).
+    /// See [`PollDataChannel`] `read_buf_cap`.
+    read_buf_cap: Option<usize>,
 }
 
 impl Connection {
@@ -75,8 +78,15 @@ impl Connection {
             data_channels_inner: StdMutex::new(DataChannelsInner {
                 map: FnvHashMap::default(),
                 incoming_data_channels_rx: data_channel_rx,
+                read_buf_cap: None,
             }),
         }
+    }
+
+    /// Set the capacity of a data channel's temporary read buffer (equal for all data channels; default: 8192).
+    pub fn set_data_channels_read_buf_capacity(&mut self, cap: usize) {
+        let mut data_channels_inner = self.data_channels_inner.lock().unwrap();
+        data_channels_inner.read_buf_cap = Some(cap);
     }
 
     /// Registers a handler for incoming data channels.
@@ -142,7 +152,10 @@ impl<'a> StreamMuxer for Connection {
         let mut data_channels_inner = self.data_channels_inner.lock().unwrap();
         match ready!(data_channels_inner.incoming_data_channels_rx.poll_next(cx)) {
             Some(detached) => {
-                let ch = PollDataChannel::new(detached);
+                let mut ch = PollDataChannel::new(detached);
+                if let Some(cap) = data_channels_inner.read_buf_cap {
+                    ch.set_read_buf_capacity(cap);
+                }
 
                 data_channels_inner
                     .map
@@ -233,9 +246,13 @@ impl<'a> StreamMuxer for Connection {
     ) -> Poll<Result<Self::Substream, Self::Error>> {
         match ready!(s.as_mut().poll(cx)) {
             Ok(detached) => {
-                let ch = PollDataChannel::new(detached);
-
                 let mut data_channels_inner = self.data_channels_inner.lock().unwrap();
+
+                let mut ch = PollDataChannel::new(detached);
+                if let Some(cap) = data_channels_inner.read_buf_cap {
+                    ch.set_read_buf_capacity(cap);
+                }
+
                 data_channels_inner
                     .map
                     .insert(ch.stream_identifier(), ch.clone());
