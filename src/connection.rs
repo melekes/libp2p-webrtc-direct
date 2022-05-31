@@ -187,7 +187,6 @@ impl<'a> StreamMuxer for Connection {
                 .create_data_channel(
                     "data",
                     Some(RTCDataChannelInit {
-                        negotiated: None,
                         id: Some(channel_id),
                         ..Default::default()
                     }),

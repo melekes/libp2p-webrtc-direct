@@ -415,7 +415,6 @@ impl WebRTCDirectTransport {
             .create_data_channel(
                 "data",
                 Some(RTCDataChannelInit {
-                    negotiated: None,
                     id: Some(1),
                     ..Default::default()
                 }),
