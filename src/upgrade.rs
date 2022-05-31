@@ -106,40 +106,15 @@ pub async fn webrtc(
         )
         .await?;
 
-    let (data_channel_rx, mut data_channel_tx) = oneshot::channel::<Arc<DetachedDataChannel>>();
+    let (tx, mut rx) = oneshot::channel::<Arc<DetachedDataChannel>>();
 
     // Wait until the data channel is opened and detach it.
     // Wait until the data channel is opened and detach it.
-    data_channel
-        .on_open({
-            let data_channel = data_channel.clone();
-            Box::new(move || {
-                debug!(
-                    "Data channel '{}'-'{}' open.",
-                    data_channel.label(),
-                    data_channel.id()
-                );
-
-                Box::pin(async move {
-                    let data_channel = data_channel.clone();
-                    match data_channel.detach().await {
-                        Ok(detached) => {
-                            if let Err(_) = data_channel_rx.send(detached) {
-                                error!("data_channel_tx dropped");
-                            }
-                        },
-                        Err(e) => {
-                            error!("Can't detach data channel: {}", e);
-                        },
-                    }
-                })
-            })
-        })
-        .await;
+    crate::connection::register_data_channel_open_handler(data_channel, tx).await;
 
     // Wait until data channel is opened and ready to use
     let detached = select! {
-        res = data_channel_tx => match res {
+        res = rx => match res {
             Ok(detached) => detached,
             Err(e) => return Err(Error::InternalError(e.to_string())),
         },

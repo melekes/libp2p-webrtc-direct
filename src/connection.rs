@@ -21,13 +21,13 @@
 mod poll_data_channel;
 
 use fnv::FnvHashMap;
-use futures::channel::mpsc::{self, Receiver, Sender};
+use futures::channel::mpsc;
+use futures::channel::oneshot::{self, Sender};
 use futures::lock::Mutex as FutMutex;
-use futures::{channel::oneshot, future::BoxFuture, prelude::*, ready};
+use futures::{future::BoxFuture, prelude::*, ready};
 use futures_lite::stream::StreamExt;
 use libp2p_core::muxing::{StreamMuxer, StreamMuxerEvent};
 use log::{debug, error, trace};
-use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc_data::data_channel::DataChannel as DetachedDataChannel;
@@ -48,15 +48,13 @@ pub struct Connection {
 struct ConnectionInner {
     /// `RTCPeerConnection` to the remote peer.
     rtc_conn: RTCPeerConnection,
-    /// The next outbound data channel ID.
-    next_outbound_channel_id: u16,
 }
 
 struct DataChannelsInner {
     /// A map of data channels.
     map: FnvHashMap<u16, PollDataChannel>,
     /// Channel onto which incoming data channels are put.
-    incoming_data_channels_rx: Receiver<Arc<DetachedDataChannel>>,
+    incoming_data_channels_rx: mpsc::Receiver<Arc<DetachedDataChannel>>,
     /// Temporary read buffer's capacity (equal for all data channels).
     /// See [`PollDataChannel`] `read_buf_cap`.
     read_buf_cap: Option<usize>,
@@ -70,11 +68,7 @@ impl Connection {
         Connection::register_incoming_data_channels_handler(&rtc_conn, data_channel_tx).await;
 
         Self {
-            connection_inner: Arc::new(FutMutex::new(ConnectionInner {
-                rtc_conn,
-                // Starts with `2` because `1` is reserved for the data channel used for authentication.
-                next_outbound_channel_id: 2,
-            })),
+            connection_inner: Arc::new(FutMutex::new(ConnectionInner { rtc_conn })),
             data_channels_inner: StdMutex::new(DataChannelsInner {
                 map: FnvHashMap::default(),
                 incoming_data_channels_rx: data_channel_rx,
@@ -92,7 +86,7 @@ impl Connection {
     /// Registers a handler for incoming data channels.
     async fn register_incoming_data_channels_handler(
         rtc_conn: &RTCPeerConnection,
-        data_channel_tx: Sender<Arc<DetachedDataChannel>>,
+        tx: mpsc::Sender<Arc<DetachedDataChannel>>,
     ) {
         rtc_conn
             .on_data_channel(Box::new(move |data_channel: Arc<RTCDataChannel>| {
@@ -101,9 +95,10 @@ impl Connection {
                     data_channel.label(),
                     data_channel.id()
                 );
-                let data_channel = data_channel.clone();
 
-                let mut data_channel_tx = data_channel_tx.clone();
+                let data_channel = data_channel.clone();
+                let mut tx = tx.clone();
+
                 Box::pin(async move {
                     data_channel
                         .on_open({
@@ -119,7 +114,7 @@ impl Connection {
                                     let data_channel = data_channel.clone();
                                     match data_channel.detach().await {
                                         Ok(detached) => {
-                                            if let Err(e) = data_channel_tx.try_send(detached) {
+                                            if let Err(e) = tx.try_send(detached) {
                                                 // This can happen if the client is not reading
                                                 // events (using `poll_event`) fast enough, which
                                                 // generally shouldn't be the case.
@@ -152,6 +147,8 @@ impl<'a> StreamMuxer for Connection {
         let mut data_channels_inner = self.data_channels_inner.lock().unwrap();
         match ready!(data_channels_inner.incoming_data_channels_rx.poll_next(cx)) {
             Some(detached) => {
+                trace!("Incoming substream {}", detached.stream_identifier());
+
                 let mut ch = PollDataChannel::new(detached);
                 if let Some(cap) = data_channels_inner.read_buf_cap {
                     ch.set_read_buf_capacity(cap);
@@ -174,61 +171,27 @@ impl<'a> StreamMuxer for Connection {
         let connection_inner = self.connection_inner.clone();
 
         Box::pin(async move {
-            let mut connection_inner = connection_inner.lock().await;
-
-            let channel_id = connection_inner.next_outbound_channel_id;
-            connection_inner.next_outbound_channel_id += 1;
-
-            trace!("Opening outbound substream {}", channel_id);
+            let connection_inner = connection_inner.lock().await;
 
             // Create a datachannel with label 'data'
             let data_channel = connection_inner
                 .rtc_conn
-                .create_data_channel(
-                    "data",
-                    Some(RTCDataChannelInit {
-                        id: Some(channel_id),
-                        ..Default::default()
-                    }),
-                )
+                .create_data_channel("data", None)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("webrtc error: {}", e)))
                 .await?;
+
+            trace!("Opening outbound substream {}", data_channel.id());
 
             // No need to hold the lock during the DTLS handshake.
             drop(connection_inner);
 
-            let (data_channel_rx, data_channel_tx) = oneshot::channel::<Arc<DetachedDataChannel>>();
+            let (tx, rx) = oneshot::channel::<Arc<DetachedDataChannel>>();
 
             // Wait until the data channel is opened and detach it.
-            data_channel
-                .on_open({
-                    let data_channel = data_channel.clone();
-                    Box::new(move || {
-                        debug!(
-                            "Data channel '{}'-'{}' open",
-                            data_channel.label(),
-                            data_channel.id()
-                        );
-
-                        Box::pin(async move {
-                            let data_channel = data_channel.clone();
-                            match data_channel.detach().await {
-                                Ok(detached) => {
-                                    if let Err(_) = data_channel_rx.send(detached) {
-                                        error!("data_channel_tx dropped");
-                                    }
-                                },
-                                Err(e) => {
-                                    error!("Can't detach data channel: {}", e);
-                                },
-                            };
-                        })
-                    })
-                })
-                .await;
+            register_data_channel_open_handler(data_channel, tx).await;
 
             // Wait until data channel is opened and ready to use
-            match data_channel_tx.await {
+            match rx.await {
                 Ok(detached) => Ok(detached),
                 Err(e) => Err(io::Error::new(io::ErrorKind::Other, e.to_string())),
             }
@@ -294,6 +257,7 @@ impl<'a> StreamMuxer for Connection {
         cx: &mut Context<'_>,
         s: &mut Self::Substream,
     ) -> Poll<Result<(), Self::Error>> {
+        trace!("Closing substream {}", s.stream_identifier());
         Pin::new(s).poll_close(cx)
     }
 
@@ -303,6 +267,8 @@ impl<'a> StreamMuxer for Connection {
     }
 
     fn close(&self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        debug!("Closing connection");
+
         // First, flush all the buffered data.
         match ready!(self.flush_all(cx)) {
             Ok(_) => {
@@ -334,4 +300,36 @@ impl<'a> StreamMuxer for Connection {
         }
         Poll::Ready(Ok(()))
     }
+}
+
+pub(crate) async fn register_data_channel_open_handler(
+    data_channel: Arc<RTCDataChannel>,
+    data_channel_tx: Sender<Arc<DetachedDataChannel>>,
+) {
+    data_channel
+        .on_open({
+            let data_channel = data_channel.clone();
+            Box::new(move || {
+                debug!(
+                    "Data channel '{}'-'{}' open",
+                    data_channel.label(),
+                    data_channel.id()
+                );
+
+                Box::pin(async move {
+                    let data_channel = data_channel.clone();
+                    match data_channel.detach().await {
+                        Ok(detached) => {
+                            if let Err(e) = data_channel_tx.send(detached) {
+                                error!("Can't send data channel: {:?}", e);
+                            }
+                        },
+                        Err(e) => {
+                            error!("Can't detach data channel: {}", e);
+                        },
+                    };
+                })
+            })
+        })
+        .await;
 }
