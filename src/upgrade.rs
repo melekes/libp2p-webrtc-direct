@@ -72,12 +72,11 @@ pub async fn webrtc(
     let peer_connection = api.new_peer_connection(config).await?;
 
     // Set the remote description to the predefined SDP.
-    let fingerprint = match addr.iter().last() {
-        Some(Protocol::XWebRTC(f)) => f,
-        _ => {
-            debug!("{} is not a WebRTC multiaddr", addr);
-            return Err(Error::InvalidMultiaddr(addr));
-        },
+    let fingerprint = if let Some(Protocol::XWebRTC(f)) = addr.iter().last() {
+        f
+    } else {
+        debug!("{} is not a WebRTC multiaddr", addr);
+        return Err(Error::InvalidMultiaddr(addr));
     };
     let client_session_description = transport::render_description(
         sdp::CLIENT_SESSION_DESCRIPTION,
@@ -101,7 +100,7 @@ pub async fn webrtc(
             Some(RTCDataChannelInit {
                 negotiated: Some(true),
                 id: Some(1),
-                ..Default::default()
+                ..RTCDataChannelInit::default()
             }),
         )
         .await?;

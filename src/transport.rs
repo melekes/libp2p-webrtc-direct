@@ -125,7 +125,7 @@ impl WebRTCDirectTransport {
         Ok(Self {
             config: RTCConfiguration {
                 certificates: vec![certificate],
-                ..Default::default()
+                ..RTCConfiguration::default()
             },
             udp_mux,
             udp_mux_addr,
@@ -416,7 +416,7 @@ impl WebRTCDirectTransport {
                 "data",
                 Some(RTCDataChannelInit {
                     id: Some(1),
-                    ..Default::default()
+                    ..RTCDataChannelInit::default()
                 }),
             )
             .await?;
@@ -478,7 +478,7 @@ pub(crate) fn render_description(description: &str, addr: SocketAddr, fingerprin
     let mut tt = TinyTemplate::new();
     tt.add_template("description", description).unwrap();
 
-    let f = fingerprint.to_owned().replace(":", "");
+    let f = fingerprint.to_owned().replace(':', "");
     let context = sdp::DescriptionContext {
         ip_version: {
             if addr.is_ipv4() {
@@ -506,7 +506,7 @@ pub(crate) fn multiaddr_to_socketaddr(addr: &Multiaddr) -> Option<SocketAddr> {
     let proto2 = iter.next()?;
     let proto3 = iter.next()?;
 
-    while let Some(proto) = iter.next() {
+    for proto in iter {
         match proto {
             Protocol::P2p(_) => {}, // Ignore a `/p2p/...` prefix of possibly outer protocols, if present.
             _ => return None,
@@ -543,7 +543,7 @@ pub(crate) fn fingerprint_of_first_certificate(config: &RTCConfiguration) -> Str
         .expect("at least one certificate")
         .get_fingerprints()
         .expect("fingerprints to succeed");
-    fingerprints.first().unwrap().value.to_owned()
+    fingerprints.first().unwrap().value.clone()
 }
 
 /// Creates a new [`SettingEngine`] and configures it.
@@ -555,7 +555,7 @@ pub(crate) fn build_setting_engine(
     let mut se = SettingEngine::default();
     // Set both ICE user and password to fingerprint.
     // It will be checked by remote side when exchanging ICE messages.
-    let f = fingerprint.to_owned().replace(":", "");
+    let f = fingerprint.to_owned().replace(':', "");
     se.set_ice_credentials(f.clone(), f);
     se.set_udp_network(UDPNetwork::Muxed(udp_mux.clone()));
     // Allow detaching data channels.
@@ -574,8 +574,8 @@ pub(crate) fn build_setting_engine(
 }
 
 fn fingerprint_from_addr<'a>(addr: &'a Multiaddr) -> Option<Cow<'a, [u8; 32]>> {
-    let mut iter = addr.iter();
-    while let Some(proto) = iter.next() {
+    let iter = addr.iter();
+    for proto in iter {
         match proto {
             Protocol::XWebRTC(f) => return Some(f),
             _ => continue,
@@ -676,7 +676,7 @@ mod tests {
     async fn dialer_connects_to_listener_ipv4() {
         let _ = env_logger::builder().is_test(true).try_init();
         let a = "127.0.0.1:0".parse().unwrap();
-        connect(a).await
+        connect(a).await;
     }
 
     #[tokio::test]
@@ -688,7 +688,7 @@ mod tests {
 
     async fn connect(listen_addr: SocketAddr) {
         let id_keys = identity::Keypair::generate_ed25519();
-        let t1_peer_id = PeerId::from_public_key(&id_keys.public().into());
+        let t1_peer_id = PeerId::from_public_key(&id_keys.public());
         let transport = {
             let kp = KeyPair::generate(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key pair");
             let cert = RTCCertificate::from_key_pair(kp).expect("certificate");
@@ -732,7 +732,7 @@ mod tests {
                 .expect("transport")
         };
         // TODO: make code cleaner wrt ":"
-        let f = &transport.cert_fingerprint().replace(":", "");
+        let f = &transport.cert_fingerprint().replace(':', "");
         let outbound = transport2
             .dial(
                 addr.with(Protocol::XWebRTC(hex_to_cow(f)))
