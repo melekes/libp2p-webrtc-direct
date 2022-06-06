@@ -18,6 +18,7 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
+use futures::io::{AsyncReadExt, AsyncWriteExt};
 use futures::{
     channel::{mpsc, oneshot},
     future,
@@ -372,8 +373,8 @@ impl WebRTCDirectTransport {
         let remote = addr.clone(); // used for logging
         trace!("dialing address: {:?}", remote);
 
-        let fingerprint = self.cert_fingerprint();
-        let se = build_setting_engine(self.udp_mux.clone(), &socket_addr, &fingerprint);
+        let our_fingerprint = self.cert_fingerprint();
+        let se = build_setting_engine(self.udp_mux.clone(), &socket_addr, &our_fingerprint);
         let api = APIBuilder::new().with_setting_engine(se).build();
 
         let peer_connection = api
@@ -392,14 +393,14 @@ impl WebRTCDirectTransport {
             .await?;
 
         // Set the remote description to the predefined SDP.
-        let fingerprint = match fingerprint_from_addr(&addr) {
-            Some(f) => f,
+        let remote_fingerprint = match fingerprint_from_addr(&addr) {
+            Some(f) => fingerprint_to_string(&f),
             None => return Err(Error::InvalidMultiaddr(addr.clone())),
         };
         let server_session_description = render_description(
             sdp::SERVER_SESSION_DESCRIPTION,
             socket_addr,
-            &fingerprint_to_string(&fingerprint),
+            &remote_fingerprint,
         );
         debug!("ANSWER: {:?}", server_session_description);
         let sdp = RTCSessionDescription::answer(server_session_description).unwrap();
@@ -443,9 +444,7 @@ impl WebRTCDirectTransport {
             .unwrap();
         let noise = NoiseConfig::xx(dh_keys);
         let info = noise.protocol_info().next().unwrap();
-        // after noise is successful and we've authenticated the remote peer, encrypted IO is no
-        // longer needed, hence ignored here.
-        let (peer_id, _) = noise
+        let (peer_id, mut noise_io) = noise
             .upgrade_outbound(PollDataChannel::new(detached), info)
             .and_then(|(remote, io)| match remote {
                 RemoteIdentity::IdentityKey(pk) => future::ok((pk.to_peer_id(), io)),
@@ -454,15 +453,36 @@ impl WebRTCDirectTransport {
             .await
             .map_err(Error::Noise)?;
 
-        // Verify peer's identity.
+        // Exchange TLS certificate fingerprints to prevent MiM attacks.
+        trace!("exchanging TLS certificate fingerprints with {}", remote);
+        let n = noise_io.write(&our_fingerprint.into_bytes()).await?;
+        noise_io.flush().await?;
+        let mut buf = vec![0; n]; // ASSERT: fingerprint's format is the same.
+        noise_io.read_exact(buf.as_mut_slice()).await?;
+        let fingerprint_from_noise =
+            String::from_utf8(buf).map_err(|_| Error::Noise(NoiseError::AuthenticationFailed))?;
+        if fingerprint_from_noise != remote_fingerprint {
+            return Err(Error::InvalidFingerprint {
+                expected: remote_fingerprint,
+                got: fingerprint_from_noise,
+            });
+        }
+
+        trace!("verifying peer's identity {}", remote);
         let peer_id_from_addr = PeerId::try_from_multiaddr(&addr);
         if peer_id_from_addr.is_none() || peer_id_from_addr.unwrap() != peer_id {
-            error!(
-                "peer_id_from_addr {:?} != peer_id {:?}",
-                peer_id_from_addr, peer_id
-            );
-            return Err(Error::InvalidMultiaddr(addr.clone()));
+            return Err(Error::InvalidPeerID {
+                expected: peer_id_from_addr,
+                got: peer_id,
+            });
         }
+
+        // Close the initial data channel after noise handshake is done.
+        // https://github.com/webrtc-rs/sctp/pull/14
+        // detached
+        //     .close()
+        //     .await
+        //     .map_err(|e| Error::WebRTC(e.into()))?;
 
         Ok((peer_id, Connection::new(peer_connection).await))
     }

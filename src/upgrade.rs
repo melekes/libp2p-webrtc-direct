@@ -18,6 +18,7 @@
 // FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 // DEALINGS IN THE SOFTWARE.
 
+use futures::io::{AsyncReadExt, AsyncWriteExt};
 use futures::{channel::oneshot, future, select, FutureExt, TryFutureExt};
 use futures_timer::Delay;
 use libp2p_core::identity;
@@ -55,9 +56,9 @@ pub async fn webrtc(
 
     let socket_addr = transport::multiaddr_to_socketaddr(&addr)
         .ok_or_else(|| Error::InvalidMultiaddr(addr.clone()))?;
-    let fingerprint = transport::fingerprint_of_first_certificate(&config);
+    let our_fingerprint = transport::fingerprint_of_first_certificate(&config);
 
-    let mut se = transport::build_setting_engine(udp_mux, &socket_addr, &fingerprint);
+    let mut se = transport::build_setting_engine(udp_mux, &socket_addr, &our_fingerprint);
     {
         // Act as a lite ICE (ICE which does not send additional candidates).
         se.set_lite(true);
@@ -72,8 +73,8 @@ pub async fn webrtc(
     let peer_connection = api.new_peer_connection(config).await?;
 
     // Set the remote description to the predefined SDP.
-    let fingerprint = if let Some(Protocol::XWebRTC(f)) = addr.iter().last() {
-        f
+    let remote_fingerprint = if let Some(Protocol::XWebRTC(f)) = addr.iter().last() {
+        transport::fingerprint_to_string(&f)
     } else {
         debug!("{} is not a WebRTC multiaddr", addr);
         return Err(Error::InvalidMultiaddr(addr));
@@ -81,7 +82,7 @@ pub async fn webrtc(
     let client_session_description = transport::render_description(
         sdp::CLIENT_SESSION_DESCRIPTION,
         socket_addr,
-        &transport::fingerprint_to_string(&fingerprint),
+        &remote_fingerprint,
     );
     debug!("OFFER: {:?}", client_session_description);
     let sdp = RTCSessionDescription::offer(client_session_description).unwrap();
@@ -128,9 +129,7 @@ pub async fn webrtc(
         .unwrap();
     let noise = NoiseConfig::xx(dh_keys);
     let info = noise.protocol_info().next().unwrap();
-    // after noise is successful and we've authenticated the remote peer, encrypted IO is no
-    // longer needed, hence ignored here.
-    let (peer_id, _) = noise
+    let (peer_id, mut noise_io) = noise
         .upgrade_inbound(PollDataChannel::new(detached.clone()), info)
         .and_then(|(remote, io)| match remote {
             RemoteIdentity::IdentityKey(pk) => future::ok((pk.to_peer_id(), io)),
@@ -139,12 +138,27 @@ pub async fn webrtc(
         .await
         .map_err(Error::Noise)?;
 
+    // Exchange TLS certificate fingerprints to prevent MiM attacks.
+    trace!("exchanging TLS certificate fingerprints with {}", addr);
+    let n = noise_io.write(&our_fingerprint.into_bytes()).await?;
+    noise_io.flush().await?;
+    let mut buf = vec![0; n]; // ASSERT: fingerprint's format is the same.
+    noise_io.read_exact(buf.as_mut_slice()).await?;
+    let fingerprint_from_noise =
+        String::from_utf8(buf).map_err(|_| Error::Noise(NoiseError::AuthenticationFailed))?;
+    if fingerprint_from_noise != remote_fingerprint {
+        return Err(Error::InvalidFingerprint {
+            expected: remote_fingerprint,
+            got: fingerprint_from_noise,
+        });
+    }
+
     // Close the initial data channel after noise handshake is done.
-    // NOTE: must be done on the receiving side (this) to avoid closing before noise is completed.
-    detached
-        .close()
-        .await
-        .map_err(|e| Error::WebRTC(e.into()))?;
+    // https://github.com/webrtc-rs/sctp/pull/14
+    // detached
+    //     .close()
+    //     .await
+    //     .map_err(|e| Error::WebRTC(e.into()))?;
 
     Ok((peer_id, Connection::new(peer_connection).await))
 }
