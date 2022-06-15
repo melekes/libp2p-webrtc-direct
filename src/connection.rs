@@ -149,10 +149,10 @@ impl<'a> StreamMuxer for Connection {
             Some(detached) => {
                 trace!("Incoming substream {}", detached.stream_identifier());
 
-                let mut ch = PollDataChannel::new(detached);
-                if let Some(cap) = data_channels_inner.read_buf_cap {
-                    ch.set_read_buf_capacity(cap);
-                }
+                let ch = PollDataChannel::new(detached);
+                // if let Some(cap) = data_channels_inner.read_buf_cap {
+                //     ch.set_read_buf_capacity(cap);
+                // }
 
                 data_channels_inner
                     .map
@@ -207,10 +207,10 @@ impl<'a> StreamMuxer for Connection {
             Ok(detached) => {
                 let mut data_channels_inner = self.data_channels_inner.lock().unwrap();
 
-                let mut ch = PollDataChannel::new(detached);
-                if let Some(cap) = data_channels_inner.read_buf_cap {
-                    ch.set_read_buf_capacity(cap);
-                }
+                let ch = PollDataChannel::new(detached);
+                // if let Some(cap) = data_channels_inner.read_buf_cap {
+                //     ch.set_read_buf_capacity(cap);
+                // }
 
                 data_channels_inner
                     .map

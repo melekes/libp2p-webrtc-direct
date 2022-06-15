@@ -28,7 +28,7 @@ use libp2p_core::{
 };
 use libp2p_core::{InboundUpgrade, UpgradeInfo};
 use libp2p_noise::{Keypair, NoiseConfig, NoiseError, RemoteIdentity, X25519Spec};
-use log::{debug, error, trace};
+use log::{debug, trace};
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_init::RTCDataChannelInit;
 use webrtc::dtls_transport::dtls_role::DTLSRole;

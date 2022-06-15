@@ -2647,7 +2647,7 @@ dependencies = [
 [[package]]
 name = "webrtc"
 version = "0.4.0"
-source = "git+https://github.com/melekes/webrtc?branch=anton/168-allow-persistent-certificates#f59f1aadb23bf4f32327eadb47639dfad56852b1"
+source = "git+https://github.com/melekes/webrtc?branch=anton/168-allow-persistent-certificates#3cbaaebacfcb808c7fd3d86b101b2d8ed48a764d"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2685,8 +2685,7 @@ dependencies = [
 [[package]]
 name = "webrtc-data"
 version = "0.3.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1c6e77d7f15d517a85b1ac10921a91b541d2358174313719cbd1ed3ee1a439d"
+source = "git+https://github.com/melekes/webrtc-data.git?branch=anton/async-read-write-for-data-channel#fc7c5f75561abc8caffa122abaa0bc7395c278be"
 dependencies = [
  "bytes",
  "derive_builder",
@@ -2738,14 +2737,16 @@ dependencies = [
 
 [[package]]
 name = "webrtc-ice"
-version = "0.6.6"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08f2a4a1ae47cdce72c648d94895131a80f0ec96d8c78d9187b37d777b9c18cf"
+checksum = "d8c20824d5b1f223b71b5db70ae327015756eb83af42f07869409cb7473a168b"
 dependencies = [
  "async-trait",
  "crc",
  "log",
  "rand 0.8.5",
+ "serde",
+ "serde_json",
  "stun",
  "thiserror",
  "tokio",
@@ -2788,9 +2789,9 @@ dependencies = [
 
 [[package]]
 name = "webrtc-sctp"
-version = "0.4.3"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d48f4c8601507ef48712acdfd5019fc68c4f42d6cf934ec6937b9737339ba030"
+checksum = "c97ba5fad11c9109608e774e90250cb2b61f6b6ce52b3b20950fc83c8db9ee87"
 dependencies = [
  "async-trait",
  "bytes",

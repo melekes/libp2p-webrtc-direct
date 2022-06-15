@@ -37,7 +37,7 @@ use libp2p_core::{
 };
 use libp2p_core::{OutboundUpgrade, UpgradeInfo};
 use libp2p_noise::{Keypair, NoiseConfig, NoiseError, RemoteIdentity, X25519Spec};
-use log::{debug, error, trace};
+use log::{debug, trace};
 use tinytemplate::TinyTemplate;
 use tokio_crate::net::{ToSocketAddrs, UdpSocket};
 use webrtc::api::setting_engine::SettingEngine;
