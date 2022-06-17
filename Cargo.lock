@@ -2647,7 +2647,7 @@ dependencies = [
 [[package]]
 name = "webrtc"
 version = "0.4.0"
-source = "git+https://github.com/melekes/webrtc?branch=anton/168-allow-persistent-certificates#3cbaaebacfcb808c7fd3d86b101b2d8ed48a764d"
+source = "git+https://github.com/melekes/webrtc?branch=anton/168-allow-persistent-certificates#d0a88f2873f76a8597ec6d2a32d88b1c1b0ae04e"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2685,7 +2685,7 @@ dependencies = [
 [[package]]
 name = "webrtc-data"
 version = "0.3.3"
-source = "git+https://github.com/melekes/webrtc-data.git?branch=anton/async-read-write-for-data-channel#fc7c5f75561abc8caffa122abaa0bc7395c278be"
+source = "git+https://github.com/webrtc-rs/data.git?branch=main#5aa264c65f52e7711bb45fc05bdec30454392276"
 dependencies = [
  "bytes",
  "derive_builder",

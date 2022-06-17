@@ -41,4 +41,4 @@ libp2p-swarm = { version = "0.35.0", git = "https://github.com/melekes/rust-libp
 libp2p-request-response = { version = "0.17.0", git = "https://github.com/melekes/rust-libp2p", branch = "anton/x-webrtc" }
 
 [patch.crates-io]
-webrtc-data = { version = "0.3.3", git = "https://github.com/melekes/webrtc-data.git", branch = "anton/async-read-write-for-data-channel" }
+webrtc-data = { version = "0.3.3", git = "https://github.com/webrtc-rs/data.git", branch = "main" }
